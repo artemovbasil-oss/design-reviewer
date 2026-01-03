@@ -1,0 +1,7 @@
+aiogram==3.13.1
+python-dotenv==1.0.1
+pytesseract==0.3.10
+Pillow==10.4.0
+opencv-python-headless==4.10.0.84
+numpy>=2.0.2,<2.2
+openai>=1.40.0
