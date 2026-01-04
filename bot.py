@@ -1,9 +1,13 @@
 # bot.py — Design Review Partner (aiogram 3.7.0)
-# Features:
-# - Review screenshots (Telegram photo)
-# - Review Figma frame links:
+# - Reviews screenshots (Telegram photo)
+# - Reviews Figma frame links:
 #   - Public files: uses Figma oEmbed thumbnail (no token required)
 #   - With FIGMA_TOKEN: uses Figma Images API for higher quality
+#
+# Notes:
+# - No python-dotenv dependency: reads local .env manually if present
+# - Emojis: kept minimal, monochrome-like symbols
+# - ASCII progress: retro style
 
 import os
 import re
@@ -82,9 +86,9 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # =============================
 # Telegram UI
 # =============================
-BTN_REVIEW = "◼︎ Закинуть на ревью (скрин/ссылка)"
-BTN_HOW = "◻︎ Как это работает?"
-BTN_PING = "▶︎ Ping"
+BTN_REVIEW = "■ Закинуть на ревью (скрин/ссылка)"
+BTN_HOW = "□ Как это работает?"
+BTN_PING = "▶ Ping"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -92,7 +96,7 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_HOW), KeyboardButton(text=BTN_PING)],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Кидай скрин или ссылку на Figma фрейм.",
+    input_field_placeholder="Кидай скрин или ссылку на Figma-фрейм.",
 )
 
 bot = Bot(
@@ -196,7 +200,7 @@ def bullets_from_any(x: Any, bullet: str = "• ") -> str:
 # =============================
 # Retro ASCII progress
 # =============================
-def retro_bar(step: int, total: int = 12) -> str:
+def retro_bar(step: int, total: int = 18) -> str:
     step = max(0, min(step, total))
     return f"[{'#' * step}{'.' * (total - step)}]"
 
@@ -211,13 +215,14 @@ def retro_screen(title: str, i: int, step: int) -> str:
     lines = [
         f"{title} {spin}",
         bar,
-        "--------------------",
+        "----------------------",
         "SIGNAL: OK   MODE: SCAN",
     ]
     return "<pre>" + "\n".join(lines) + "</pre>"
 
 
 async def safe_edit_text_or_recreate(msg: Message, text: str) -> Message:
+    # Telegram may disallow editing (too old / already edited / etc.)
     try:
         await msg.edit_text(text)
         return msg
@@ -231,9 +236,9 @@ async def safe_edit_text_or_recreate(msg: Message, text: str) -> Message:
 
 async def animate_progress(msg: Message, title: str = "SCAN") -> Message:
     current = msg
-    for i in range(12):
-        current = await safe_edit_text_or_recreate(current, retro_screen(title, i, step=min(i, 10)))
-        await asyncio.sleep(0.16)
+    for i in range(14):
+        current = await safe_edit_text_or_recreate(current, retro_screen(title, i, step=min(i, 12)))
+        await asyncio.sleep(0.14)
     return current
 
 
@@ -327,7 +332,6 @@ def parse_figma_link(url: str) -> Optional[Dict[str, str]]:
 async def figma_public_thumbnail(url: str) -> bytes:
     """
     For PUBLIC Figma links: use oEmbed to get thumbnail_url (works without token).
-    Quality is limited but enough for review.
     """
     oembed = f"https://www.figma.com/api/oembed?url={quote_plus(url)}"
     async with aiohttp.ClientSession() as session:
@@ -339,7 +343,7 @@ async def figma_public_thumbnail(url: str) -> bytes:
 
         thumb = data.get("thumbnail_url") or data.get("thumbnail_url_with_play_button")
         if not thumb:
-            raise RuntimeError("Figma oEmbed did not return thumbnail_url (maybe not public?)")
+            raise RuntimeError("Figma oEmbed did not return thumbnail_url (file might be private)")
 
         async with session.get(thumb, timeout=aiohttp.ClientTimeout(total=40)) as r2:
             if r2.status != 200:
@@ -349,7 +353,7 @@ async def figma_public_thumbnail(url: str) -> bytes:
 
 async def figma_images_api_png(file_key: str, node_id_api: str, scale: float = 2.0) -> bytes:
     """
-    Higher quality (requires FIGMA_TOKEN).
+    Higher quality (requires FIGMA_TOKEN) + node-id.
     """
     if not FIGMA_TOKEN:
         raise RuntimeError("FIGMA_TOKEN is not set")
@@ -500,9 +504,10 @@ def analyze_ui_with_openai(image_b64: str, extracted: Dict[str, Any]) -> Dict[st
     out_text = extract_output_text(resp)
     data = parse_llm_json(out_text)
     if not data:
-        # fallback: show raw (short)
+        # fallback: show raw (short) — but keep it human
+        raw = (out_text[:900] or "Не смог собрать отчёт из ответа модели.").strip()
         return {
-            "description": (out_text[:900] or "Не смог собрать отчёт из ответа модели."),
+            "description": raw,
             "score": 5,
             "visual": ["—"],
             "text": ["—"],
@@ -527,10 +532,10 @@ async def run_review_for_image(m: Message, img: Image.Image, title: str = "SCAN"
 
     img_b64 = img_to_base64_png(img)
 
-    progress = await m.answer("SCAN\n<pre>[............]</pre>")
+    progress = await m.answer("SCAN\n<pre>[..................]</pre>")
     progress = await animate_progress(progress, title=title)
 
-    progress = await set_progress(progress, "OCR", i=1, step=4)
+    progress = await set_progress(progress, "OCR", i=1, step=6)
 
     extracted = {"ok": False, "text": "", "blocks": []}
     ocr = ocr_extract(img)
@@ -541,9 +546,9 @@ async def run_review_for_image(m: Message, img: Image.Image, title: str = "SCAN"
         if not extracted.get("ok"):
             extracted = {"ok": False, "text": ocr.get("text", ""), "blocks": ocr.get("blocks", [])}
 
-    progress = await set_progress(progress, "REVIEW", i=2, step=8)
+    progress = await set_progress(progress, "REVIEW", i=2, step=12)
     result = analyze_ui_with_openai(img_b64, extracted)
-    progress = await set_progress(progress, "DONE", i=3, step=12)
+    progress = await set_progress(progress, "DONE", i=3, step=18)
 
     desc = html_escape(str(result.get("description", "")).strip()) or "—"
     score = clamp_score(result.get("score", 6))
@@ -559,14 +564,16 @@ async def run_review_for_image(m: Message, img: Image.Image, title: str = "SCAN"
 async def run_review_for_figma_link(m: Message, url: str) -> None:
     info = parse_figma_link(url)
     if not info:
-        await m.answer("Не вижу нормальную ссылку Figma. Пришли URL на фрейм/экран.", reply_markup=keyboard)
+        await m.answer("Ссылка не похожа на Figma design/file. Пришли URL на фрейм/экран.", reply_markup=keyboard)
         return
 
-    # Prefer Images API if token+node-id exist (higher quality)
+    await m.answer("Принял ссылку. Пробую вытащить превью из Figma…", reply_markup=keyboard)
+
     png_bytes: Optional[bytes] = None
     used = "FIGMA"
 
     try:
+        # Prefer Images API if token+node-id exist (higher quality)
         if FIGMA_TOKEN and info.get("node_id_api"):
             png_bytes = await figma_images_api_png(
                 file_key=info["file_key"],
@@ -590,7 +597,7 @@ async def run_review_for_figma_link(m: Message, url: str) -> None:
     try:
         img = Image.open(BytesIO(png_bytes)).convert("RGBA")
     except Exception:
-        await m.answer("Скачалось что-то странное — не открылось как PNG/JPG.", reply_markup=keyboard)
+        await m.answer("Скачалось нечто, но не открылось как картинка (PNG/JPG).", reply_markup=keyboard)
         return
 
     await run_review_for_image(m, img, title=used)
@@ -606,7 +613,7 @@ async def start(m: Message):
         "Я принимаю на ревью:\n"
         "• скриншоты интерфейса (картинки)\n"
         "• ссылки на фреймы Figma — <b>если файл публичный</b>\n\n"
-        "Кидай — разберу. Если хорошо, похвалю конкретно. Если плохо — докопаюсь и предложу, как чинить.",
+        "Кидай. Если хорошо — похвалю по делу. Если плохо — докопаюсь и скажу, как чинить.",
         reply_markup=keyboard,
     )
 
@@ -614,8 +621,9 @@ async def start(m: Message):
 @dp.message(F.text == BTN_REVIEW)
 async def ask_review(m: Message):
     await m.answer(
-        "Ок. Отправь:\n"
-        "1) скриншот (картинку) <b>или</b>\n"
+        "Ок.\n"
+        "Отправь:\n"
+        "1) скриншот (картинку) ИЛИ\n"
         "2) ссылку на Figma фрейм (публичный файл).\n\n"
         "Жду.",
         reply_markup=keyboard,
@@ -652,7 +660,7 @@ async def handle_photo(m: Message):
     lock = get_chat_lock(chat_id)
 
     if lock.locked():
-        await m.answer("Секунду. Я уже разбираю другой экран. Не смешиваем отчёты.", reply_markup=keyboard)
+        await m.answer("Секунду. Я уже разбираю другой экран. Не мешай отчётам смешаться.", reply_markup=keyboard)
         return
 
     async with lock:
@@ -672,17 +680,32 @@ async def handle_photo(m: Message):
         await run_review_for_image(m, img, title="SCAN")
 
 
-@dp.message(F.text.regexp(r"figma\.com/(file|design)/"))
+# FIX: do not rely on F.text.regexp here; catch anything containing figma.com/ reliably
+@dp.message(F.text & F.text.contains("figma.com/"))
 async def handle_figma_link(m: Message):
     chat_id = m.chat.id
     lock = get_chat_lock(chat_id)
 
     if lock.locked():
-        await m.answer("Секунду. Я уже разбираю другой экран. Не смешиваем отчёты.", reply_markup=keyboard)
+        await m.answer("Секунду. Я уже разбираю другой экран. Не мешай отчётам смешаться.", reply_markup=keyboard)
+        return
+
+    url = (m.text or "").strip()
+
+    # Validate it's really a Figma design/file link
+    if not re.search(r"https?://(www\.)?figma\.com/(file|design)/", url):
+        await m.answer(
+            "Ссылка похожа на Figma, но формат странный.\n"
+            "Пришли ссылку вида:\n"
+            "https://www.figma.com/design/<key>/... ?node-id=...\n"
+            "или\n"
+            "https://www.figma.com/file/<key>/... ?node-id=...",
+            reply_markup=keyboard,
+        )
         return
 
     async with lock:
-        await run_review_for_figma_link(m, m.text or "")
+        await run_review_for_figma_link(m, url)
 
 
 @dp.message()
