@@ -1,9 +1,9 @@
 # bot.py (aiogram 3.7.0) — Design Review Partner (Railway-safe)
-# - Без requests/httpx/dotenv (dotenv грузим вручную, если локально есть .env)
-# - ASCII-анимации прогресса + fallback если сообщение нельзя редактировать
-# - Лок на чат: один скрин за раз, чтобы анимации/отчёты не путались
-# - 3 сообщения: что вижу / визуал (с оценкой) / тексты
-# - Строго, но без мата. Похвала — только конкретная.
+# FIXES:
+# 1) Больше НЕТ спама ASCII-сообщениями: если Telegram запретил edit — анимация молча останавливается.
+# 2) Ошибки анализа — по-человечески: почему могло упасть и что сделать.
+# 3) Лок на чат: один скрин за раз, чтобы прогресс/ответы не путались.
+# 4) 3 сообщения: что вижу / визуал (оценка) / тексты.
 
 import os
 import re
@@ -63,6 +63,7 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 # =============================
 # Telegram UI
 # =============================
@@ -84,6 +85,7 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
+
 
 # =============================
 # Concurrency: per-chat lock
@@ -138,36 +140,40 @@ def ascii_frame(i: int) -> str:
 
 
 def spinner_frame(i: int) -> str:
-    # Доп. ASCII для «веселья»
     sp = ["|", "/", "—", "\\"]
     return sp[i % len(sp)]
 
 
-async def safe_edit_text(msg: Message, text: str) -> Message:
+async def safe_edit_text(msg: Message, text: str) -> bool:
     """
     Пытаемся отредактировать сообщение.
-    Если Telegram запрещает — отправляем новое и возвращаем его (чтобы дальше редактировать уже его).
+    Если Telegram запрещает edit — НЕ шлём новое (чтобы не спамить).
+    Возвращаем True/False (получилось ли отредактировать).
     """
     try:
         await msg.edit_text(text)
-        return msg
+        return True
     except TelegramBadRequest:
-        # message can't be edited / message to edit not found / etc.
-        return await msg.answer(text, reply_markup=keyboard)
+        return False
 
 
-async def animate_progress(msg: Message, title: str = "🔍 Смотрю внимательно…") -> Message:
+async def animate_progress(msg: Message, title: str = "🔍 Смотрю внимательно…") -> None:
     """
-    ASCII-анимация прогресса. Возвращает "живое" сообщение, которое можно редактировать дальше.
+    ASCII-анимация прогресса.
+    Если edit запрещён — молча прекращаем, не спамим новыми сообщениями.
     """
-    cur = msg
+    last_text = None
     for i in range(6):
-        cur = await safe_edit_text(
-            cur,
-            f"{title} {spinner_frame(i)}\n<code>{ascii_frame(i)}</code>"
-        )
+        cur_text = f"{title} {spinner_frame(i)}\n<code>{ascii_frame(i)}</code>"
+        ok = await safe_edit_text(msg, cur_text)
+        # если нельзя редактировать — выходим
+        if not ok:
+            break
+        # защита от бессмысленных правок (иногда Telegram "не любит" частые одинаковые)
+        if last_text == cur_text:
+            break
+        last_text = cur_text
         await asyncio.sleep(0.22)
-    return cur
 
 
 def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
@@ -183,11 +189,11 @@ def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
 
 def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
     """
-    Возвращает dict:
+    Returns dict:
       description, score, visual, text
     """
     prompt = """
-Ты — старший продуктовый дизайнер и жёсткий, но адекватный дизайн-ревьюер.
+Ты — старший продуктовый дизайнер и требовательный дизайн-ревьюер.
 Говоришь по-русски. Без мата. Без сюсюканья.
 Если хорошо — хвали конкретно. Если плохо — ругай конкретно и предлагай улучшения.
 
@@ -219,7 +225,6 @@ def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
         max_output_tokens=900,
     )
 
-    # Собираем output_text
     out_text = ""
     for item in getattr(resp, "output", []) or []:
         for c in item.content or []:
@@ -229,7 +234,7 @@ def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
     out_text = out_text.strip()
     data = parse_llm_json(out_text)
     if not data:
-        # fallback: вернём хотя бы текст
+        # fallback: хоть что-то
         return {
             "description": (out_text[:900] or "Модель вернула пустой ответ."),
             "score": 5,
@@ -243,6 +248,13 @@ def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
         "visual": str(data.get("visual", "")).strip(),
         "text": str(data.get("text", "")).strip(),
     }
+
+
+async def progress_set(msg: Message, title: str, i: int) -> None:
+    """
+    Единичная установка прогресса. Если edit запрещён — просто молчим.
+    """
+    await safe_edit_text(msg, f"{title} {spinner_frame(i)}\n<code>{ascii_frame(i)}</code>")
 
 
 # =============================
@@ -266,8 +278,9 @@ async def help_msg(m: Message):
     await m.answer(
         "Как пользоваться:\n"
         "• Отправь скриншот.\n"
-        "• Пришлю 3 сообщения: описание / визуал / тексты.\n\n"
-        "Если текст мелкий — пришли скрин крупнее, будет точнее.",
+        "• Я покажу прогресс ASCII.\n"
+        "• Потом пришлю 3 сообщения: описание / визуал / тексты.\n\n"
+        "Если текст мелкий — пришли скрин крупнее (или обрежь лишнее) — будет точнее.",
         reply_markup=keyboard,
     )
 
@@ -291,10 +304,9 @@ async def handle_photo(m: Message):
     lock = get_chat_lock(chat_id)
 
     if lock.locked():
-        # Если уже идёт обработка — мягко попросим подождать (без "жди")
         await m.answer(
-            "⛔ Сейчас я уже разбираю другой скрин.\n"
-            "Кинь этот ещё раз через минуту — иначе всё перемешается.",
+            "⛔ Я уже разбираю другой скрин.\n"
+            "Кинь этот чуть позже, иначе мы сами себе всё перемешаем.",
             reply_markup=keyboard,
         )
         return
@@ -302,14 +314,12 @@ async def handle_photo(m: Message):
     async with lock:
         progress = await m.answer("⏳ Принял. Загружаю…", reply_markup=keyboard)
 
-        # ASCII-анимация (без падений)
-        progress = await animate_progress(progress, title="🔍 Смотрю внимательно…")
+        # Попробуем анимировать (если Telegram запретит edit — просто остановится)
+        await animate_progress(progress, title="🔍 Смотрю внимательно…")
 
-        # Получаем file_path
         photo = m.photo[-1]
         file = await bot.get_file(photo.file_id)
 
-        # Скачиваем bytes
         bio = BytesIO()
         await bot.download_file(file.file_path, destination=bio)
         bio.seek(0)
@@ -317,28 +327,38 @@ async def handle_photo(m: Message):
         try:
             img = Image.open(bio).convert("RGBA")
         except Exception:
-            await safe_edit_text(progress, "⚠️ Не смог открыть картинку. Пришли другой файл.")
+            # Даже если edit запрещён — отправим отдельным сообщением, чтобы пользователь увидел.
+            await m.answer("⚠️ Не смог открыть картинку. Пришли другой файл.", reply_markup=keyboard)
             return
 
-        progress = await safe_edit_text(
-            progress,
-            f"🧠 Думаю… {spinner_frame(0)}\n<code>{ascii_frame(5)}</code>"
-        )
+        await progress_set(progress, "🧠 Думаю…", 5)
 
         try:
             result = analyze_ui_with_openai(img_to_base64_png(img))
         except Exception:
-            await safe_edit_text(progress, "⚠️ Упало при анализе. Попробуй другой скрин.")
+            # Нормальное человекочитаемое объяснение
+            await m.answer(
+                "⚠️ Я не смог нормально разобрать этот экран.\n\n"
+                "Обычно это бывает, если:\n"
+                "• текст слишком мелкий или размытый\n"
+                "• скрин перегружен деталями\n"
+                "• интерфейс обрезан или снят с блюром\n\n"
+                "Что сделать:\n"
+                "— пришли скрин крупнее\n"
+                "— обрежь лишнее вокруг экрана\n"
+                "— если это веб — сделай зум 125–150% и пересними",
+                reply_markup=keyboard,
+            )
             return
 
-        progress = await safe_edit_text(progress, f"✅ Готово.\n<code>{ascii_frame(6)}</code>")
+        await progress_set(progress, "✅ Готово.", 6)
 
-        # 3 сообщения отчёта
         desc = html_escape(result.get("description", "")) or "—"
         visual = html_escape(result.get("visual", "")) or "—"
         text = html_escape(result.get("text", "")) or "—"
         score = clamp_score(result.get("score", 6))
 
+        # 3 сообщения отчёта
         await m.answer(f"👀 <b>Что я вижу</b>\n{desc}", reply_markup=keyboard)
         await m.answer(f"🎛 <b>Визуал</b> — оценка: <b>{score}/10</b>\n{visual}", reply_markup=keyboard)
         await m.answer(f"✍️ <b>Тексты</b>\n{text}", reply_markup=keyboard)
@@ -347,7 +367,7 @@ async def handle_photo(m: Message):
 @dp.message()
 async def fallback(m: Message):
     await m.answer(
-        "Я жду скриншот интерфейса 🙂\n"
+        "Я жду скриншот интерфейса.\n"
         "Отправь картинку — и я устрою ревью.",
         reply_markup=keyboard,
     )
