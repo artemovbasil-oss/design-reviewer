@@ -1,15 +1,11 @@
-# Bereke UI Text Checker Bot — v3
-Бот для проверки интерфейсных текстов по редакционной политике Bereke Business.
+# Design Review Partner (Telegram bot)
 
-## Новое в версии 3
-- `/examples` — примеры «Плохо → Хорошо`
-- `/check <текст>` — проверить строку прямо в чате без скриншота
+Telegram bot that reviews UI screenshots (visual + text) with an LLM and OCR.
 
-## Запуск
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements_macos.txt
-cp .env.example .env
-python bot.py
-```
+## Setup
+1) Create .env based on env.example
+2) Create venv and install dependencies
+3) Run: python bot.py
+
+## Notes
+- Never commit .env
