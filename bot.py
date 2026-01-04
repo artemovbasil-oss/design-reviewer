@@ -1,4 +1,10 @@
-# bot.py (aiogram 3.7.0) — Design Review Partner
+# bot.py (aiogram 3.7.0) — Design Review Partner (Railway-safe)
+# - Без requests/httpx/dotenv (dotenv грузим вручную, если локально есть .env)
+# - ASCII-анимации прогресса + fallback если сообщение нельзя редактировать
+# - Лок на чат: один скрин за раз, чтобы анимации/отчёты не путались
+# - 3 сообщения: что вижу / визуал (с оценкой) / тексты
+# - Строго, но без мата. Похвала — только конкретная.
+
 import os
 import re
 import json
@@ -8,26 +14,24 @@ from io import BytesIO
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+from PIL import Image
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 
 from openai import OpenAI
 
-try:
-    from PIL import Image
-except Exception:
-    Image = None  # pillow must be installed
 
-
-# -----------------------------
-# Optional local .env loader (NO dependency)
-# -----------------------------
-def load_local_env_file():
+# =============================
+# Optional local .env loader (NO python-dotenv dependency)
+# =============================
+def load_local_env_file() -> None:
     """
     Railway: не нужен.
-    Локально: если рядом есть .env — загрузим простым парсером, без python-dotenv.
+    Локально: если рядом есть .env — загрузим простым парсером.
     Формат: KEY=VALUE (без export)
     """
     env_path = Path(__file__).with_name(".env")
@@ -36,9 +40,7 @@ def load_local_env_file():
     try:
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
+            if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
             k = k.strip()
@@ -58,14 +60,12 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set (Railway Variables or local .env)")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set (Railway Variables or local .env)")
-if Image is None:
-    raise RuntimeError("Pillow (PIL) is not installed. Add pillow to requirements.txt")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# -----------------------------
+# =============================
 # Telegram UI
-# -----------------------------
+# =============================
 BTN_SEND = "🖼 Закинуть скрин"
 BTN_HELP = "ℹ️ Как пользоваться"
 BTN_PING = "🏓 Ping"
@@ -85,16 +85,28 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# =============================
+# Concurrency: per-chat lock
+# =============================
+_CHAT_LOCKS: Dict[int, asyncio.Lock] = {}
 
-# -----------------------------
+
+def get_chat_lock(chat_id: int) -> asyncio.Lock:
+    lock = _CHAT_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CHAT_LOCKS[chat_id] = lock
+    return lock
+
+
+# =============================
 # Helpers
-# -----------------------------
+# =============================
 def html_escape(text: str) -> str:
-    """Чтобы Telegram HTML не ломался."""
     return (
         text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
     )
 
 
@@ -106,40 +118,59 @@ def clamp_score(x: Any) -> int:
     return max(1, min(10, n))
 
 
-def img_to_png_bytes(image: Image.Image) -> bytes:
+def img_to_base64_png(image: Image.Image) -> str:
     buf = BytesIO()
     image.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def img_to_base64_png(image: Image.Image) -> str:
-    return base64.b64encode(img_to_png_bytes(image)).decode("utf-8")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 def ascii_frame(i: int) -> str:
     frames = [
-        "▱▱▱▱▱  ",
-        "▰▱▱▱▱  ",
-        "▰▰▱▱▱  ",
-        "▰▰▰▱▱  ",
-        "▰▰▰▰▱  ",
-        "▰▰▰▰▰  ",
-        "▰▰▰▰▰✓ ",
+        "▱▱▱▱▱",
+        "▰▱▱▱▱",
+        "▰▰▱▱▱",
+        "▰▰▰▱▱",
+        "▰▰▰▰▱",
+        "▰▰▰▰▰",
+        "▰▰▰▰▰✓",
     ]
     return frames[max(0, min(i, len(frames) - 1))]
 
 
-async def animate_progress(msg: Message):
+def spinner_frame(i: int) -> str:
+    # Доп. ASCII для «веселья»
+    sp = ["|", "/", "—", "\\"]
+    return sp[i % len(sp)]
+
+
+async def safe_edit_text(msg: Message, text: str) -> Message:
+    """
+    Пытаемся отредактировать сообщение.
+    Если Telegram запрещает — отправляем новое и возвращаем его (чтобы дальше редактировать уже его).
+    """
+    try:
+        await msg.edit_text(text)
+        return msg
+    except TelegramBadRequest:
+        # message can't be edited / message to edit not found / etc.
+        return await msg.answer(text, reply_markup=keyboard)
+
+
+async def animate_progress(msg: Message, title: str = "🔍 Смотрю внимательно…") -> Message:
+    """
+    ASCII-анимация прогресса. Возвращает "живое" сообщение, которое можно редактировать дальше.
+    """
+    cur = msg
     for i in range(6):
-        await msg.edit_text(f"🔍 Смотрю внимательно…\n<code>{ascii_frame(i)}</code>")
-        await asyncio.sleep(0.25)
+        cur = await safe_edit_text(
+            cur,
+            f"{title} {spinner_frame(i)}\n<code>{ascii_frame(i)}</code>"
+        )
+        await asyncio.sleep(0.22)
+    return cur
 
 
 def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
-    """
-    LLM иногда возвращает JSON с текстом вокруг.
-    Достаём первый {...} блок.
-    """
     raw = raw.strip()
     m = re.search(r"\{.*\}", raw, flags=re.S)
     if not m:
@@ -152,7 +183,7 @@ def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
 
 def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
     """
-    Возвращаем dict:
+    Возвращает dict:
       description, score, visual, text
     """
     prompt = """
@@ -161,20 +192,19 @@ def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
 Если хорошо — хвали конкретно. Если плохо — ругай конкретно и предлагай улучшения.
 
 Важно:
-- Никаких технических деталей (пиксели, медианы, коды цветов).
+- Никаких технических деталей (пиксели, коды цветов, расчёты).
 - Про шрифт/палитру — только предположения (например: "похоже на sans-serif типа Inter/SF/Roboto").
-- Нужно быть полезным: "что не так" + "что сделать".
+- Учитывай контекст: заголовок ≠ кнопка. Не выдумывай элементы, которых нет.
 
 Верни СТРОГО JSON:
 {
   "description": "2–6 предложений: что происходит на экране",
   "score": 1-10,
-  "visual": "5–12 пунктов: визуал/UX (можно с похвалой)",
+  "visual": "5–12 пунктов: визуал/UX (с похвалой, если есть)",
   "text": "6–14 пунктов: текст (каждый пункт: Проблема → Почему плохо → Как исправить)"
 }
 """
 
-    # Responses API, multimodal
     resp = client.responses.create(
         model=LLM_MODEL,
         input=[
@@ -189,7 +219,7 @@ def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
         max_output_tokens=900,
     )
 
-    # собираем текст ответа
+    # Собираем output_text
     out_text = ""
     for item in getattr(resp, "output", []) or []:
         for c in item.content or []:
@@ -199,9 +229,9 @@ def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
     out_text = out_text.strip()
     data = parse_llm_json(out_text)
     if not data:
-        # fallback: вернём хотя бы что-то
+        # fallback: вернём хотя бы текст
         return {
-            "description": out_text[:800] or "Не смог разобрать ответ модели.",
+            "description": (out_text[:900] or "Модель вернула пустой ответ."),
             "score": 5,
             "visual": "—",
             "text": "—",
@@ -215,9 +245,9 @@ def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
     }
 
 
-# -----------------------------
+# =============================
 # Handlers
-# -----------------------------
+# =============================
 @dp.message(F.text.in_({"/start", "start"}))
 async def start(m: Message):
     await m.answer(
@@ -226,7 +256,7 @@ async def start(m: Message):
         "1) скажу, что вижу\n"
         "2) разнесу (или похвалю) визуал\n"
         "3) разнесу (или похвалю) тексты\n\n"
-        "Жми кнопку снизу или просто отправь картинку.",
+        "Нажми кнопку снизу или просто отправь картинку.",
         reply_markup=keyboard,
     )
 
@@ -236,9 +266,8 @@ async def help_msg(m: Message):
     await m.answer(
         "Как пользоваться:\n"
         "• Отправь скриншот.\n"
-        "• Я покажу прогресс ASCII.\n"
-        "• Потом пришлю 3 сообщения: описание / визуал / тексты.\n\n"
-        "Совет: если текст мелкий — пришли скрин крупнее, будет точнее.",
+        "• Пришлю 3 сообщения: описание / визуал / тексты.\n\n"
+        "Если текст мелкий — пришли скрин крупнее, будет точнее.",
         reply_markup=keyboard,
     )
 
@@ -246,58 +275,73 @@ async def help_msg(m: Message):
 @dp.message(F.text == BTN_PING)
 async def ping(m: Message):
     await m.answer(
-        f"pong ✅\n"
-        f"MODEL: <code>{html_escape(LLM_MODEL)}</code>",
+        f"pong ✅\nMODEL: <code>{html_escape(LLM_MODEL)}</code>",
         reply_markup=keyboard,
     )
 
 
 @dp.message(F.text == BTN_SEND)
 async def ask(m: Message):
-    await m.answer("Ок. Закидывай скрин. Я посмотрю как следует.", reply_markup=keyboard)
+    await m.answer("Ок. Закидывай скрин. Посмотрю как следует.", reply_markup=keyboard)
 
 
 @dp.message(F.photo)
 async def handle_photo(m: Message):
-    # progress message
-    progress = await m.answer("⏳ Загружаю…", reply_markup=keyboard)
-    await animate_progress(progress)
+    chat_id = m.chat.id
+    lock = get_chat_lock(chat_id)
 
-    # get file
-    photo = m.photo[-1]
-    file = await bot.get_file(photo.file_id)
-
-    # download bytes
-    bio = BytesIO()
-    await bot.download_file(file.file_path, destination=bio)
-    bio.seek(0)
-
-    try:
-        img = Image.open(bio).convert("RGBA")
-    except Exception:
-        await progress.edit_text("⚠️ Не смог открыть картинку. Пришли другой файл.")
+    if lock.locked():
+        # Если уже идёт обработка — мягко попросим подождать (без "жди")
+        await m.answer(
+            "⛔ Сейчас я уже разбираю другой скрин.\n"
+            "Кинь этот ещё раз через минуту — иначе всё перемешается.",
+            reply_markup=keyboard,
+        )
         return
 
-    await progress.edit_text(f"🧠 Думаю…\n<code>{ascii_frame(5)}</code>")
+    async with lock:
+        progress = await m.answer("⏳ Принял. Загружаю…", reply_markup=keyboard)
 
-    try:
-        result = analyze_ui_with_openai(img_to_base64_png(img))
-    except Exception as e:
-        await progress.edit_text("⚠️ Упало при анализе. Попробуй другой скрин.")
-        # для себя можно логировать, но в чат не спамим техничкой
-        return
+        # ASCII-анимация (без падений)
+        progress = await animate_progress(progress, title="🔍 Смотрю внимательно…")
 
-    await progress.edit_text(f"✅ Готово.\n<code>{ascii_frame(6)}</code>")
+        # Получаем file_path
+        photo = m.photo[-1]
+        file = await bot.get_file(photo.file_id)
 
-    # send 3 messages
-    desc = html_escape(result["description"]) or "—"
-    visual = html_escape(result["visual"]) or "—"
-    text = html_escape(result["text"]) or "—"
-    score = result["score"]
+        # Скачиваем bytes
+        bio = BytesIO()
+        await bot.download_file(file.file_path, destination=bio)
+        bio.seek(0)
 
-    await m.answer(f"👀 <b>Что я вижу</b>\n{desc}", reply_markup=keyboard)
-    await m.answer(f"🎛 <b>Визуал</b> — оценка: <b>{score}/10</b>\n{visual}", reply_markup=keyboard)
-    await m.answer(f"✍️ <b>Тексты</b>\n{text}", reply_markup=keyboard)
+        try:
+            img = Image.open(bio).convert("RGBA")
+        except Exception:
+            await safe_edit_text(progress, "⚠️ Не смог открыть картинку. Пришли другой файл.")
+            return
+
+        progress = await safe_edit_text(
+            progress,
+            f"🧠 Думаю… {spinner_frame(0)}\n<code>{ascii_frame(5)}</code>"
+        )
+
+        try:
+            result = analyze_ui_with_openai(img_to_base64_png(img))
+        except Exception:
+            await safe_edit_text(progress, "⚠️ Упало при анализе. Попробуй другой скрин.")
+            return
+
+        progress = await safe_edit_text(progress, f"✅ Готово.\n<code>{ascii_frame(6)}</code>")
+
+        # 3 сообщения отчёта
+        desc = html_escape(result.get("description", "")) or "—"
+        visual = html_escape(result.get("visual", "")) or "—"
+        text = html_escape(result.get("text", "")) or "—"
+        score = clamp_score(result.get("score", 6))
+
+        await m.answer(f"👀 <b>Что я вижу</b>\n{desc}", reply_markup=keyboard)
+        await m.answer(f"🎛 <b>Визуал</b> — оценка: <b>{score}/10</b>\n{visual}", reply_markup=keyboard)
+        await m.answer(f"✍️ <b>Тексты</b>\n{text}", reply_markup=keyboard)
 
 
 @dp.message()
@@ -309,11 +353,11 @@ async def fallback(m: Message):
     )
 
 
-# -----------------------------
+# =============================
 # Run
-# -----------------------------
+# =============================
 async def main():
-    print("✅ Design Review Partner starting…")
+    print(f"✅ Design Review Partner starting… model={LLM_MODEL}")
     await dp.start_polling(bot)
 
 
