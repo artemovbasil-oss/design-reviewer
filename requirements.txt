@@ -1,3 +1,5 @@
 aiogram==3.7.0
 openai==2.2.0
 pillow==10.4.0
+pytesseract==0.3.10
+opencv-python-headless==4.10.0.84
