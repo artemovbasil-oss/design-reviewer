@@ -4,20 +4,20 @@
 #   - Public files: uses Figma oEmbed thumbnail (no token required)
 #   - With FIGMA_TOKEN: uses Figma Images API for higher quality
 #
-# Notes:
-# - No python-dotenv dependency: reads local .env manually if present
-# - Emojis: kept minimal, monochrome-like symbols
-# - ASCII progress: retro style
+# Fixes in this version:
+# - Strong anti-cache: headers + cache-buster query params for every Figma fetch
+# - Sends preview image back to user (so you see what exactly is being reviewed)
 
 import os
 import re
 import json
 import base64
 import asyncio
+import time
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from urllib.parse import urlparse, parse_qs, quote_plus
+from urllib.parse import urlparse, parse_qs, quote_plus, urlsplit, urlunsplit, urlencode, parse_qsl
 
 import aiohttp
 from PIL import Image
@@ -29,6 +29,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 
 from openai import OpenAI
+
 
 # OCR (optional)
 try:
@@ -197,6 +198,25 @@ def bullets_from_any(x: Any, bullet: str = "• ") -> str:
     return s or "—"
 
 
+def add_cache_buster(url: str, key: str = "cb", value: Optional[str] = None) -> str:
+    """
+    Adds/overwrites query param cb=<timestamp> to avoid CDN/proxy caching.
+    """
+    if not value:
+        value = str(int(time.time() * 1000))
+    parts = urlsplit(url)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q[key] = value
+    new_query = urlencode(q, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+
+
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, max-age=0",
+    "Pragma": "no-cache",
+}
+
+
 # =============================
 # Retro ASCII progress
 # =============================
@@ -222,7 +242,6 @@ def retro_screen(title: str, i: int, step: int) -> str:
 
 
 async def safe_edit_text_or_recreate(msg: Message, text: str) -> Message:
-    # Telegram may disallow editing (too old / already edited / etc.)
     try:
         await msg.edit_text(text)
         return msg
@@ -332,10 +351,14 @@ def parse_figma_link(url: str) -> Optional[Dict[str, str]]:
 async def figma_public_thumbnail(url: str) -> bytes:
     """
     For PUBLIC Figma links: use oEmbed to get thumbnail_url (works without token).
+    Strong anti-cache: add cb param and no-cache headers.
     """
+    cb = str(int(time.time() * 1000))
     oembed = f"https://www.figma.com/api/oembed?url={quote_plus(url)}"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(oembed, timeout=aiohttp.ClientTimeout(total=20)) as r:
+    oembed = add_cache_buster(oembed, value=cb)
+
+    async with aiohttp.ClientSession(headers=NO_CACHE_HEADERS) as session:
+        async with session.get(oembed, timeout=aiohttp.ClientTimeout(total=25)) as r:
             if r.status != 200:
                 txt = await r.text()
                 raise RuntimeError(f"Figma oEmbed error: {r.status} {txt[:200]}")
@@ -345,7 +368,9 @@ async def figma_public_thumbnail(url: str) -> bytes:
         if not thumb:
             raise RuntimeError("Figma oEmbed did not return thumbnail_url (file might be private)")
 
-        async with session.get(thumb, timeout=aiohttp.ClientTimeout(total=40)) as r2:
+        thumb = add_cache_buster(thumb, value=cb)
+
+        async with session.get(thumb, timeout=aiohttp.ClientTimeout(total=60)) as r2:
             if r2.status != 200:
                 raise RuntimeError(f"Thumbnail download error: {r2.status}")
             return await r2.read()
@@ -354,19 +379,23 @@ async def figma_public_thumbnail(url: str) -> bytes:
 async def figma_images_api_png(file_key: str, node_id_api: str, scale: float = 2.0) -> bytes:
     """
     Higher quality (requires FIGMA_TOKEN) + node-id.
+    Strong anti-cache: add cb param and no-cache headers.
     """
     if not FIGMA_TOKEN:
         raise RuntimeError("FIGMA_TOKEN is not set")
     if not node_id_api:
         raise RuntimeError("No node-id in link")
 
-    headers = {"X-Figma-Token": FIGMA_TOKEN}
+    headers = {"X-Figma-Token": FIGMA_TOKEN, **NO_CACHE_HEADERS}
     api_url = f"https://api.figma.com/v1/images/{file_key}"
+    cb = str(int(time.time() * 1000))
+
     params = {
         "ids": node_id_api,
         "format": "png",
         "scale": str(scale),
         "use_absolute_bounds": "true",
+        "cb": cb,
     }
 
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -382,7 +411,9 @@ async def figma_images_api_png(file_key: str, node_id_api: str, scale: float = 2
             err = data.get("err") or "No image URL returned (wrong node-id or no access?)"
             raise RuntimeError(f"Figma: {err}")
 
-        async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=60)) as r2:
+        img_url = add_cache_buster(img_url, value=cb)
+
+        async with session.get(img_url, timeout=aiohttp.ClientTimeout(total=90)) as r2:
             if r2.status != 200:
                 raise RuntimeError(f"Figma image download error: {r2.status}")
             return await r2.read()
@@ -504,7 +535,6 @@ def analyze_ui_with_openai(image_b64: str, extracted: Dict[str, Any]) -> Dict[st
     out_text = extract_output_text(resp)
     data = parse_llm_json(out_text)
     if not data:
-        # fallback: show raw (short) — but keep it human
         raw = (out_text[:900] or "Не смог собрать отчёт из ответа модели.").strip()
         return {
             "description": raw,
@@ -525,7 +555,6 @@ def analyze_ui_with_openai(image_b64: str, extracted: Dict[str, Any]) -> Dict[st
 # Core review runner
 # =============================
 async def run_review_for_image(m: Message, img: Image.Image, title: str = "SCAN") -> None:
-    # upscale small images
     w, h = img.size
     if max(w, h) < 1400:
         img = img.resize((w * 2, h * 2), Image.LANCZOS)
@@ -548,7 +577,7 @@ async def run_review_for_image(m: Message, img: Image.Image, title: str = "SCAN"
 
     progress = await set_progress(progress, "REVIEW", i=2, step=12)
     result = analyze_ui_with_openai(img_b64, extracted)
-    progress = await set_progress(progress, "DONE", i=3, step=18)
+    await set_progress(progress, "DONE", i=3, step=18)
 
     desc = html_escape(str(result.get("description", "")).strip()) or "—"
     score = clamp_score(result.get("score", 6))
@@ -567,7 +596,7 @@ async def run_review_for_figma_link(m: Message, url: str) -> None:
         await m.answer("Ссылка не похожа на Figma design/file. Пришли URL на фрейм/экран.", reply_markup=keyboard)
         return
 
-    await m.answer("Принял ссылку. Пробую вытащить превью из Figma…", reply_markup=keyboard)
+    await m.answer("Принял ссылку. Достаю превью из Figma…", reply_markup=keyboard)
 
     png_bytes: Optional[bytes] = None
     used = "FIGMA"
@@ -599,6 +628,17 @@ async def run_review_for_figma_link(m: Message, url: str) -> None:
     except Exception:
         await m.answer("Скачалось нечто, но не открылось как картинка (PNG/JPG).", reply_markup=keyboard)
         return
+
+    # Show preview (what bot actually reviews)
+    try:
+        preview = img.convert("RGB")
+        out = BytesIO()
+        preview.save(out, format="JPEG", quality=88, optimize=True)
+        out.seek(0)
+        await m.answer_photo(out, caption="Превью, которое я буду разбирать.")
+    except Exception:
+        # ignore preview failures
+        pass
 
     await run_review_for_image(m, img, title=used)
 
@@ -635,7 +675,7 @@ async def how_it_works(m: Message):
     await m.answer(
         "<b>Как это работает</b>\n"
         "1) Закидываешь скрин или ссылку на Figma-фрейм (публичный).\n"
-        "2) Магия.\n"
+        "2) Я показываю ретро-прогресс.\n"
         "3) Потом 3 сообщения: что вижу / визуал / тексты.\n\n"
         "Если текст мелкий — пришли скрин крупнее или обрежь лишнее.",
         reply_markup=keyboard,
@@ -680,7 +720,7 @@ async def handle_photo(m: Message):
         await run_review_for_image(m, img, title="SCAN")
 
 
-# FIX: do not rely on F.text.regexp here; catch anything containing figma.com/ reliably
+# Catch any text containing figma.com/ reliably
 @dp.message(F.text & F.text.contains("figma.com/"))
 async def handle_figma_link(m: Message):
     chat_id = m.chat.id
@@ -692,7 +732,6 @@ async def handle_figma_link(m: Message):
 
     url = (m.text or "").strip()
 
-    # Validate it's really a Figma design/file link
     if not re.search(r"https?://(www\.)?figma\.com/(file|design)/", url):
         await m.answer(
             "Ссылка похожа на Figma, но формат странный.\n"
