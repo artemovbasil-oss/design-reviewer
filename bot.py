@@ -1,144 +1,321 @@
+# bot.py (aiogram 3.7.0) — Design Review Partner
 import os
-import asyncio
+import re
+import json
 import base64
+import asyncio
 from io import BytesIO
-
-from dotenv import load_dotenv
-from PIL import Image
+from pathlib import Path
+from typing import Dict, Any, Optional
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from openai import OpenAI
 
-# ================== ENV ==================
-load_dotenv()
+try:
+    from PIL import Image
+except Exception:
+    Image = None  # pillow must be installed
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+# -----------------------------
+# Optional local .env loader (NO dependency)
+# -----------------------------
+def load_local_env_file():
+    """
+    Railway: не нужен.
+    Локально: если рядом есть .env — загрузим простым парсером, без python-dotenv.
+    Формат: KEY=VALUE (без export)
+    """
+    env_path = Path(__file__).with_name(".env")
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            os.environ.setdefault(k, v)
+    except Exception:
+        pass
+
+
+load_local_env_file()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-
+    raise RuntimeError("BOT_TOKEN is not set (Railway Variables or local .env)")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+    raise RuntimeError("OPENAI_API_KEY is not set (Railway Variables or local .env)")
+if Image is None:
+    raise RuntimeError("Pillow (PIL) is not installed. Add pillow to requirements.txt")
 
-# ================== INIT ==================
-bot = Bot(
-    token=BOT_TOKEN,
-    default={"parse_mode": ParseMode.HTML},
-)
-dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ================== UI ==================
+# -----------------------------
+# Telegram UI
+# -----------------------------
+BTN_SEND = "🖼 Закинуть скрин"
+BTN_HELP = "ℹ️ Как пользоваться"
+BTN_PING = "🏓 Ping"
+
 keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="🖼 Закинуть скриншот")]],
+    keyboard=[
+        [KeyboardButton(text=BTN_SEND)],
+        [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_PING)],
+    ],
     resize_keyboard=True,
+    input_field_placeholder="Кидай скрин — я разберу без сантиментов (но по делу).",
 )
 
-# ================== HELPERS ==================
-def image_to_base64(image: Image.Image) -> str:
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def html_escape(text: str) -> str:
+    """Чтобы Telegram HTML не ломался."""
+    return (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
+
+
+def clamp_score(x: Any) -> int:
+    try:
+        n = int(x)
+    except Exception:
+        n = 6
+    return max(1, min(10, n))
+
+
+def img_to_png_bytes(image: Image.Image) -> bytes:
     buf = BytesIO()
     image.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
+    return buf.getvalue()
 
-async def ascii_progress(msg: Message):
+
+def img_to_base64_png(image: Image.Image) -> str:
+    return base64.b64encode(img_to_png_bytes(image)).decode("utf-8")
+
+
+def ascii_frame(i: int) -> str:
     frames = [
-        "▱▱▱▱▱",
-        "▰▱▱▱▱",
-        "▰▰▱▱▱",
-        "▰▰▰▱▱",
-        "▰▰▰▰▱",
-        "▰▰▰▰▰",
+        "▱▱▱▱▱  ",
+        "▰▱▱▱▱  ",
+        "▰▰▱▱▱  ",
+        "▰▰▰▱▱  ",
+        "▰▰▰▰▱  ",
+        "▰▰▰▰▰  ",
+        "▰▰▰▰▰✓ ",
     ]
-    for f in frames:
-        await msg.edit_text(f"🔍 Анализирую интерфейс…\n`{f}`")
-        await asyncio.sleep(0.3)
+    return frames[max(0, min(i, len(frames) - 1))]
 
-# ================== LLM ==================
-def analyze_ui(image_b64: str) -> dict:
+
+async def animate_progress(msg: Message):
+    for i in range(6):
+        await msg.edit_text(f"🔍 Смотрю внимательно…\n<code>{ascii_frame(i)}</code>")
+        await asyncio.sleep(0.25)
+
+
+def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
+    """
+    LLM иногда возвращает JSON с текстом вокруг.
+    Достаём первый {...} блок.
+    """
+    raw = raw.strip()
+    m = re.search(r"\{.*\}", raw, flags=re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def analyze_ui_with_openai(image_b64: str) -> Dict[str, Any]:
+    """
+    Возвращаем dict:
+      description, score, visual, text
+    """
     prompt = """
-Ты — старший продуктовый дизайнер.
-Ты честный, придирчивый, но справедливый.
+Ты — старший продуктовый дизайнер и жёсткий, но адекватный дизайн-ревьюер.
+Говоришь по-русски. Без мата. Без сюсюканья.
+Если хорошо — хвали конкретно. Если плохо — ругай конкретно и предлагай улучшения.
 
-Задача:
-1. Опиши, что ты видишь на интерфейсе
-2. Дай общую оценку UI/UX по шкале 1–10
-3. Напиши отчёт по визуалу (что плохо и как улучшить, если есть — похвали)
-4. Напиши отчёт по текстам (ясность, тон, UX-копирайтинг)
+Важно:
+- Никаких технических деталей (пиксели, медианы, коды цветов).
+- Про шрифт/палитру — только предположения (например: "похоже на sans-serif типа Inter/SF/Roboto").
+- Нужно быть полезным: "что не так" + "что сделать".
 
-Требования:
-- Без технических деталей
-- Без размеров, кодов цветов, пикселей
-- Шрифты и стиль — только предположения
-- Без мата, но строго
-- Говори как опытный коллега
-
-Ответ верни СТРОГО в JSON:
+Верни СТРОГО JSON:
 {
-  "description": "...",
-  "score": 0,
-  "visual": "...",
-  "text": "..."
+  "description": "2–6 предложений: что происходит на экране",
+  "score": 1-10,
+  "visual": "5–12 пунктов: визуал/UX (можно с похвалой)",
+  "text": "6–14 пунктов: текст (каждый пункт: Проблема → Почему плохо → Как исправить)"
 }
 """
 
-    response = client.responses.create(
+    # Responses API, multimodal
+    resp = client.responses.create(
         model=LLM_MODEL,
         input=[
             {
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_base64": image_b64,
-                    },
+                    {"type": "input_image", "image_base64": image_b64},
                 ],
             }
         ],
+        max_output_tokens=900,
     )
 
-    return response.output_parsed[0]["content"][0]["json"]
+    # собираем текст ответа
+    out_text = ""
+    for item in getattr(resp, "output", []) or []:
+        for c in item.content or []:
+            if getattr(c, "type", None) == "output_text":
+                out_text += getattr(c, "text", "") + "\n"
 
-# ================== HANDLERS ==================
-@dp.message(F.text == "/start")
+    out_text = out_text.strip()
+    data = parse_llm_json(out_text)
+    if not data:
+        # fallback: вернём хотя бы что-то
+        return {
+            "description": out_text[:800] or "Не смог разобрать ответ модели.",
+            "score": 5,
+            "visual": "—",
+            "text": "—",
+        }
+
+    return {
+        "description": str(data.get("description", "")).strip(),
+        "score": clamp_score(data.get("score", 6)),
+        "visual": str(data.get("visual", "")).strip(),
+        "text": str(data.get("text", "")).strip(),
+    }
+
+
+# -----------------------------
+# Handlers
+# -----------------------------
+@dp.message(F.text.in_({"/start", "start"}))
 async def start(m: Message):
     await m.answer(
-        "👋 Я твой дизайн-партнёр.\n\n"
-        "Кидай скриншот интерфейса — я разберу его как на настоящем дизайн-ревью.\n"
-        "Похвалю, если есть за что. Докопаюсь, если есть косяки.",
+        "👋 Я — твой <b>партнёр по дизайн-ревью</b>.\n\n"
+        "Кидай скрин интерфейса — я:\n"
+        "1) скажу, что вижу\n"
+        "2) разнесу (или похвалю) визуал\n"
+        "3) разнесу (или похвалю) тексты\n\n"
+        "Жми кнопку снизу или просто отправь картинку.",
         reply_markup=keyboard,
     )
 
+
+@dp.message(F.text == BTN_HELP)
+async def help_msg(m: Message):
+    await m.answer(
+        "Как пользоваться:\n"
+        "• Отправь скриншот.\n"
+        "• Я покажу прогресс ASCII.\n"
+        "• Потом пришлю 3 сообщения: описание / визуал / тексты.\n\n"
+        "Совет: если текст мелкий — пришли скрин крупнее, будет точнее.",
+        reply_markup=keyboard,
+    )
+
+
+@dp.message(F.text == BTN_PING)
+async def ping(m: Message):
+    await m.answer(
+        f"pong ✅\n"
+        f"MODEL: <code>{html_escape(LLM_MODEL)}</code>",
+        reply_markup=keyboard,
+    )
+
+
+@dp.message(F.text == BTN_SEND)
+async def ask(m: Message):
+    await m.answer("Ок. Закидывай скрин. Я посмотрю как следует.", reply_markup=keyboard)
+
+
 @dp.message(F.photo)
-async def handle_image(m: Message):
-    progress = await m.answer("⏳ Загружаю…")
-    await ascii_progress(progress)
+async def handle_photo(m: Message):
+    # progress message
+    progress = await m.answer("⏳ Загружаю…", reply_markup=keyboard)
+    await animate_progress(progress)
 
+    # get file
     photo = m.photo[-1]
-    file = await bot.download(photo.file_id)
-    image = Image.open(file)
+    file = await bot.get_file(photo.file_id)
 
-    image_b64 = image_to_base64(image)
+    # download bytes
+    bio = BytesIO()
+    await bot.download_file(file.file_path, destination=bio)
+    bio.seek(0)
 
     try:
-        result = analyze_ui(image_b64)
+        img = Image.open(bio).convert("RGBA")
+    except Exception:
+        await progress.edit_text("⚠️ Не смог открыть картинку. Пришли другой файл.")
+        return
+
+    await progress.edit_text(f"🧠 Думаю…\n<code>{ascii_frame(5)}</code>")
+
+    try:
+        result = analyze_ui_with_openai(img_to_base64_png(img))
     except Exception as e:
-        await progress.edit_text("⚠️ Ошибка анализа. Попробуй другой скрин.")
-        raise e
+        await progress.edit_text("⚠️ Упало при анализе. Попробуй другой скрин.")
+        # для себя можно логировать, но в чат не спамим техничкой
+        return
 
-    await progress.delete()
+    await progress.edit_text(f"✅ Готово.\n<code>{ascii_frame(6)}</code>")
 
-    await m.answer(f"👀 <b>Что я вижу</b>\n{result['description']}")
-    await m.answer(f"📊 <b>Оценка</b>: {result['score']} / 10")
-    await m.answer(f"🎨 <b>Визуал</b>\n{result['visual']}")
-    await m.answer(f"✍️ <b>Тексты</b>\n{result['text']}")
+    # send 3 messages
+    desc = html_escape(result["description"]) or "—"
+    visual = html_escape(result["visual"]) or "—"
+    text = html_escape(result["text"]) or "—"
+    score = result["score"]
 
-# ================== RUN ==================
+    await m.answer(f"👀 <b>Что я вижу</b>\n{desc}", reply_markup=keyboard)
+    await m.answer(f"🎛 <b>Визуал</b> — оценка: <b>{score}/10</b>\n{visual}", reply_markup=keyboard)
+    await m.answer(f"✍️ <b>Тексты</b>\n{text}", reply_markup=keyboard)
+
+
+@dp.message()
+async def fallback(m: Message):
+    await m.answer(
+        "Я жду скриншот интерфейса 🙂\n"
+        "Отправь картинку — и я устрою ревью.",
+        reply_markup=keyboard,
+    )
+
+
+# -----------------------------
+# Run
+# -----------------------------
+async def main():
+    print("✅ Design Review Partner starting…")
+    await dp.start_polling(bot)
+
+
 if __name__ == "__main__":
-    print("✅ Design Review Partner is running")
-    asyncio.run(dp.start_polling(bot))
+    asyncio.run(main())
