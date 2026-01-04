@@ -1,8 +1,9 @@
 # bot.py — Design Review Partner (aiogram 3.7.0)
-# - ASCII прогресс с fallback (если edit нельзя, создаём 1 новый прогресс-месседж и редактируем его)
-# - Hybrid: OCR (если доступен) -> иначе LLM "extract"
-# - 3 итоговых сообщения: что вижу / визуал (оценка) / тексты
-# - Без тех. деталей (px/цвет-коды), шрифты/палитра — только догадки
+# FIX: OpenAI Responses vision input uses image_url="data:image/png;base64,..."
+# - ASCII progress with fallback (edit -> recreate once)
+# - Hybrid: OCR (if available) -> else LLM extract
+# - 3 final messages: what I see / visual (score) / text
+# - No px/color codes; fonts/palette only as guesses
 
 import os
 import re
@@ -95,7 +96,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# per-chat lock (чтобы прогресс/ответы не путались)
+# per-chat lock (to avoid mixed replies)
 _CHAT_LOCKS: Dict[int, asyncio.Lock] = {}
 
 
@@ -132,6 +133,10 @@ def img_to_base64_png(image: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def data_url_from_b64_png(b64: str) -> str:
+    return f"data:image/png;base64,{b64}"
+
+
 def ascii_bar(i: int) -> str:
     frames = [
         "▱▱▱▱▱",
@@ -160,14 +165,21 @@ def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def extract_output_text(resp: Any) -> str:
+    out_text = ""
+    for item in getattr(resp, "output", []) or []:
+        for c in getattr(item, "content", []) or []:
+            if getattr(c, "type", None) == "output_text":
+                out_text += getattr(c, "text", "") + "\n"
+    return out_text.strip()
+
+
 # =============================
 # Progress animation (no-spam but always visible)
 # =============================
 async def safe_edit_text_or_recreate(msg: Message, text: str) -> Message:
     """
-    Пытаемся отредактировать msg.
-    Если Telegram не даёт редактировать (message can't be edited) —
-    создаём ОДНО новое прогресс-сообщение и продолжаем на нём.
+    Try edit. If Telegram forbids editing -> create ONE new progress message and continue there.
     """
     try:
         await msg.edit_text(text)
@@ -218,7 +230,7 @@ def ocr_extract(pil: Image.Image) -> Dict[str, Any]:
     {
       ok: bool,
       text: str,
-      blocks: [ {text, kind_guess} ... ]  # bbox intentionally removed for simplicity
+      blocks: [ {text, kind_guess} ... ]
     }
     """
     if not OCR_PY_AVAILABLE:
@@ -228,7 +240,6 @@ def ocr_extract(pil: Image.Image) -> Dict[str, Any]:
         img = preprocess_for_ocr(pil)
         data = pytesseract.image_to_data(img, lang=OCR_LANG, output_type=pytesseract.Output.DICT)
     except Exception as e:
-        # Most common on Railway: tesseract binary missing
         return {"ok": False, "reason": f"tesseract error: {e}", "text": "", "blocks": []}
 
     n = len(data.get("text", []))
@@ -256,7 +267,6 @@ def ocr_extract(pil: Image.Image) -> Dict[str, Any]:
         line = " ".join(words).strip()
         if not line:
             continue
-        # Very rough guess
         kind = "text"
         if len(line) <= 20:
             kind = "title_or_button"
@@ -273,11 +283,12 @@ def ocr_extract(pil: Image.Image) -> Dict[str, Any]:
 def llm_extract_text_structure(image_b64: str) -> Dict[str, Any]:
     """
     Fallback when OCR isn't available: ask LLM to extract text blocks.
+    Uses image_url data-URL (Responses API).
     Returns:
       { ok: bool, text: str, blocks: [{text, kind_guess}] }
     """
     prompt = """
-Ты видишь скрин интерфейса. Твоя задача — вытащить текст и понять структуру.
+Ты видишь скрин интерфейса. Твоя задача — вытащить текст и структуру.
 Верни СТРОГО JSON:
 {
   "text": "весь текст на экране одной строкой (если что-то не читается — пропусти)",
@@ -287,28 +298,27 @@ def llm_extract_text_structure(image_b64: str) -> Dict[str, Any]:
   ]
 }
 Без лишних ключей. Без пояснений. Только JSON.
-"""
-    resp = client.responses.create(
-        model=LLM_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_base64": image_b64},
-                ],
-            }
-        ],
-        max_output_tokens=700,
-    )
+""".strip()
 
-    out_text = ""
-    for item in getattr(resp, "output", []) or []:
-        for c in item.content or []:
-            if getattr(c, "type", None) == "output_text":
-                out_text += getattr(c, "text", "") + "\n"
+    try:
+        resp = client.responses.create(
+            model=LLM_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url_from_b64_png(image_b64)},
+                    ],
+                }
+            ],
+            max_output_tokens=700,
+        )
+    except Exception as e:
+        return {"ok": False, "reason": f"LLM extract error: {e}", "text": "", "blocks": []}
 
-    data = parse_llm_json(out_text.strip())
+    out_text = extract_output_text(resp)
+    data = parse_llm_json(out_text)
     if not data:
         return {"ok": False, "text": "", "blocks": []}
 
@@ -316,6 +326,7 @@ def llm_extract_text_structure(image_b64: str) -> Dict[str, Any]:
     blocks = data.get("blocks", [])
     if not isinstance(blocks, list):
         blocks = []
+
     cleaned = []
     for b in blocks[:80]:
         if not isinstance(b, dict):
@@ -361,32 +372,34 @@ def analyze_ui_with_openai(image_b64: str, extracted: Dict[str, Any]) -> Dict[st
   "visual": "5–12 пунктов: визуал/UX (с похвалой, если есть)",
   "text": "6–14 пунктов: текст (каждый пункт: Проблема → Почему плохо → Как исправить)"
 }}
-"""
+""".strip()
 
-    resp = client.responses.create(
-        model=LLM_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_base64": image_b64},
-                ],
-            }
-        ],
-        max_output_tokens=950,
-    )
+    try:
+        resp = client.responses.create(
+            model=LLM_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url_from_b64_png(image_b64)},
+                    ],
+                }
+            ],
+            max_output_tokens=950,
+        )
+    except Exception as e:
+        return {
+            "description": "Не смог вызвать модель (ошибка на стороне API).",
+            "score": 5,
+            "visual": f"Причина: {e}",
+            "text": "Попробуй другой ключ/модель или проверь, что модель поддерживает картинки.",
+        }
 
-    out_text = ""
-    for item in getattr(resp, "output", []) or []:
-        for c in item.content or []:
-            if getattr(c, "type", None) == "output_text":
-                out_text += getattr(c, "text", "") + "\n"
-
-    out_text = out_text.strip()
+    out_text = extract_output_text(resp)
     data = parse_llm_json(out_text)
     if not data:
-        # fallback: plain text without dict junk
+        # fallback: plain (no dict junk)
         return {
             "description": (out_text[:900] or "Не смог собрать отчёт из ответа модели."),
             "score": 5,
@@ -457,7 +470,7 @@ async def handle_photo(m: Message):
         return
 
     async with lock:
-        # 1) Initial progress (без клавиатуры — меньше шансов, что Telegram запретит edit)
+        # 1) Initial progress (no keyboard to reduce edit issues)
         progress = await m.answer("⏳ Принял. Загружаю…")
         progress = await animate_progress(progress, title="🔍 Смотрю внимательно…")
 
@@ -474,7 +487,7 @@ async def handle_photo(m: Message):
             await m.answer("⚠️ Не смог открыть картинку. Пришли другой файл.", reply_markup=keyboard)
             return
 
-        # 2) Upscale small images (helps both OCR and vision)
+        # 2) Upscale small images (helps OCR + vision)
         w, h = img.size
         if max(w, h) < 1400:
             img = img.resize((w * 2, h * 2), Image.LANCZOS)
@@ -486,34 +499,19 @@ async def handle_photo(m: Message):
 
         extracted = {"ok": False, "text": "", "blocks": []}
         ocr = ocr_extract(img)
-        if ocr.get("ok") and (len((ocr.get("text") or "").strip()) >= 12):
+
+        if ocr.get("ok") and len((ocr.get("text") or "").strip()) >= 12:
             extracted = {"ok": True, "text": ocr.get("text", ""), "blocks": ocr.get("blocks", [])}
         else:
-            # LLM extract fallback
             extracted = llm_extract_text_structure(img_b64)
             if not extracted.get("ok"):
-                # last resort: keep what OCR gave (even if weak)
+                # last resort: keep whatever OCR managed to get
                 extracted = {"ok": False, "text": ocr.get("text", ""), "blocks": ocr.get("blocks", [])}
 
         # 4) Review
         progress = await set_progress(progress, "🧠 Думаю…", 5)
 
-        try:
-            result = analyze_ui_with_openai(img_b64, extracted)
-        except Exception:
-            await m.answer(
-                "⚠️ Упал на анализе.\n\n"
-                "Скорее всего:\n"
-                "• слишком мелкий текст\n"
-                "• экран перегружен\n"
-                "• часть интерфейса обрезана\n\n"
-                "Попробуй:\n"
-                "— скрин крупнее\n"
-                "— обрезать лишнее вокруг\n"
-                "— на вебе: зум 125–150% и переснять",
-                reply_markup=keyboard,
-            )
-            return
+        result = analyze_ui_with_openai(img_b64, extracted)
 
         progress = await set_progress(progress, "✅ Готово.", 6)
 
@@ -522,7 +520,6 @@ async def handle_photo(m: Message):
         text = html_escape(result.get("text", "")) or "—"
         score = clamp_score(result.get("score", 6))
 
-        # 5) Final 3 messages (+ keyboard again)
         await m.answer(f"👀 <b>Что я вижу</b>\n{desc}", reply_markup=keyboard)
         await m.answer(f"🎛 <b>Визуал</b> — оценка: <b>{score}/10</b>\n{visual}", reply_markup=keyboard)
         await m.answer(f"✍️ <b>Тексты</b>\n{text}", reply_markup=keyboard)
