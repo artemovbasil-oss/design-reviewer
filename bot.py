@@ -1,512 +1,466 @@
 # bot.py
-import os, io, json, base64, asyncio, warnings
-from typing import List, Dict, Any, Optional
+import os
+import re
+import json
+import base64
+import asyncio
+from pathlib import Path
+from typing import Optional, Tuple
 
-import requests
-from PIL import Image
-import pytesseract
+import httpx
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.filters import CommandStart
-from aiogram.enums.parse_mode import ParseMode
+from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.client.default import DefaultBotProperties
 
-from html import escape as htmlesc
+try:
+    from PIL import Image
+except Exception:
+    Image = None
 
-warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
+# OCR optional
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
 
-# -------------------------------------------------------
-# env
-# -------------------------------------------------------
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+# ---------------------------
+# Env / Config
+# ---------------------------
 
-OCR_LANG = os.getenv("OCR_LANG", "rus+eng")
-OCR_MIN_CONF = float(os.getenv("OCR_MIN_CONF", "55"))
-OCR_MIN_WORD_CONF = float(os.getenv("OCR_MIN_WORD_CONF", "45"))
+def load_env():
+    # ВАЖНО: не используем find_dotenv() (он у тебя падал AssertionError)
+    env_path = Path(__file__).with_name(".env")
+    if env_path.exists():
+        load_dotenv(dotenv_path=str(env_path), override=False)
 
+
+def env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key, str(default)).strip().lower()
+    return v in ("1", "true", "yes", "y", "on")
+
+
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)).strip())
+    except Exception:
+        return default
+
+
+load_env()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in .env or environment")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY in .env or environment")
 
-# -------------------------------------------------------
-# aiogram setup
-# -------------------------------------------------------
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🖼 Закинуть скрин и получить ревью")],
-        [KeyboardButton(text="ℹ️ Что умеешь?")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Кидай скрин 👇",
-)
+LLM_ENABLED = env_bool("LLM_ENABLED", True)
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
-# -------------------------------------------------------
-# helpers
-# -------------------------------------------------------
-def ascii_bar(p: int, width: int = 22) -> str:
-    p = max(0, min(100, p))
-    filled = int(round(width * p / 100))
-    return "[" + "█" * filled + "░" * (width - filled) + f"] {p}%"
+OCR_ENABLED = env_bool("OCR_ENABLED", True)
+OCR_LANG = os.getenv("OCR_LANG", "rus+eng").strip()
+OCR_MIN_CONF = env_int("OCR_MIN_CONF", 55)
 
-SPINNER = ["⠁", "⠂", "⠄", "⡀", "⢀", "⠠", "⠐", "⠈"]
-PULSE = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█", "▇", "▆", "▅", "▄", "▃", "▂"]
+RULES_PATH = os.getenv("RULES_PATH", "rules.json").strip()
 
-async def progress_edit(msg: Message, title: str, p: int, note: str = "", tick: int = 0):
-    spin = SPINNER[tick % len(SPINNER)]
-    pulse = PULSE[tick % len(PULSE)]
-    text = (
-        f"<b>{htmlesc(title)}</b> {spin}\n"
-        f"<code>{htmlesc(ascii_bar(p))}</code>\n"
-        f"<code>processing {pulse}{pulse}{pulse}</code>"
+# Telegram UI
+BTN_SEND_SCREEN = "🖼 Закинуть скрин"
+BTN_HELP = "ℹ️ Как пользоваться"
+BTN_PING = "🏓 Ping"
+
+
+# ---------------------------
+# Rules loader (optional)
+# ---------------------------
+
+def load_rules_text() -> str:
+    """
+    Мы не заставляем LLM работать строго по JSON-структуре.
+    Но даём краткое резюме правил, если rules.json есть.
+    """
+    p = Path(__file__).with_name(RULES_PATH)
+    if not p.exists():
+        return "Правила: (rules.json не найден; ревью делаем по общим принципам понятности и B2B-тона)."
+
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return "Правила: (rules.json есть, но не удалось прочитать JSON; ревью делаем по общим принципам)."
+
+    # Ожидаем, что там есть список правил/категорий. Но не привязываемся.
+    # Соберём в текст: самые важные принципы.
+    chunks = []
+    if isinstance(data, dict):
+        if "principles" in data and isinstance(data["principles"], list):
+            for x in data["principles"][:20]:
+                if isinstance(x, str) and x.strip():
+                    chunks.append(f"- {x.strip()}")
+        if "rules" in data and isinstance(data["rules"], list):
+            for r in data["rules"][:30]:
+                if isinstance(r, dict):
+                    t = r.get("title") or r.get("name") or r.get("id")
+                    d = r.get("description") or r.get("what") or r.get("problem")
+                    if t and d:
+                        chunks.append(f"- {str(t).strip()}: {str(d).strip()}")
+    if not chunks:
+        return "Правила: (rules.json прочитан, но структура нестандартная; ревью делаем по общим принципам + здравому смыслу)."
+
+    return "Коротко о правилах/принципах:\n" + "\n".join(chunks)
+
+
+RULES_TEXT = load_rules_text()
+
+
+# ---------------------------
+# Helpers
+# ---------------------------
+
+def ascii_progress_frame(step: int, total: int = 10, label: str = "Обрабатываю") -> str:
+    filled = max(0, min(total, step))
+    bar = "#" * filled + "-" * (total - filled)
+    # чуть больше ASCII-вайба
+    return (
+        f"{label}...\n"
+        f"[{bar}] {filled}/{total}\n"
+        f"╭──────────────╮\n"
+        f"│   {('▰' * filled).ljust(total)}   │\n"
+        f"╰──────────────╯"
     )
-    if note:
-        text += f"\n{htmlesc(note)}"
-    await msg.edit_text(text)
 
-async def animate_stage(
-    msg: Message,
-    title: str,
-    p_from: int,
-    p_to: int,
-    note: str,
-    steps: int = 7,
-    delay: float = 0.08,
-):
-    for i in range(steps):
-        p = int(p_from + (p_to - p_from) * (i / max(1, steps - 1)))
-        await progress_edit(msg, title, p, note, tick=i)
-        await asyncio.sleep(delay)
 
-def image_to_data_url_png(img_bytes: bytes) -> str:
-    b64 = base64.b64encode(img_bytes).decode("utf-8")
-    return f"data:image/png;base64,{b64}"
+def clean_text(s: str) -> str:
+    # чистим странные пробелы/мусор
+    s = s.replace("\u00a0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
-def safe_list(x: Any) -> List[Any]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return x
-    if isinstance(x, tuple):
-        return list(x)
-    if isinstance(x, dict):
-        vals = list(x.values())
-        return vals if vals else list(x.keys())
-    if isinstance(x, str):
-        return [x]
-    return [str(x)]
 
-def safe_text(x: Any) -> str:
-    if x is None:
+def score_clamp(x: int) -> int:
+    return max(1, min(10, x))
+
+
+def guess_font_family_from_image_text(ocr_text: str) -> str:
+    # Мы честно "угадываем". Без статистик и размеров.
+    # На деле шрифт по OCR почти не вытащить; делаем мягкий вывод.
+    if not ocr_text:
+        return "Не уверен (мало текста для угадывания)"
+    # просто нейтральная формулировка
+    return "Похоже на современный sans-serif (типа Inter / SF / Roboto) — без гарантий"
+
+
+def ocr_extract_text(image_path: str) -> str:
+    if not OCR_ENABLED:
         return ""
-    if isinstance(x, str):
-        return x.strip()
-    if isinstance(x, dict):
-        for k in ("description", "text", "value"):
-            if k in x and isinstance(x[k], str):
-                return x[k].strip()
-        return " ".join(str(v) for v in x.values()).strip()
-    return str(x).strip()
+    if pytesseract is None or Image is None:
+        return ""
+    try:
+        img = Image.open(image_path)
+        # tesseract конфиг: табы/пробелы, нормальный режим
+        data = pytesseract.image_to_data(img, lang=OCR_LANG, output_type=pytesseract.Output.DICT)
+        words = []
+        n = len(data.get("text", []))
+        for i in range(n):
+            txt = (data["text"][i] or "").strip()
+            conf = data.get("conf", [])[i]
+            try:
+                conf_i = int(float(conf))
+            except Exception:
+                conf_i = -1
+            if txt and conf_i >= OCR_MIN_CONF:
+                words.append(txt)
+        return clean_text(" ".join(words))
+    except Exception:
+        return ""
 
-# -------------------------------------------------------
-# OCR
-# -------------------------------------------------------
-def ocr_lines(pil_img: Image.Image) -> List[Dict[str, Any]]:
-    gray = pil_img.convert("L")
-    data = pytesseract.image_to_data(
-        gray,
-        lang=OCR_LANG,
-        config="--oem 3 --psm 6",
-        output_type=pytesseract.Output.DICT,
-    )
 
-    words = []
-    for i in range(len(data["text"])):
-        txt = (data["text"][i] or "").strip()
-        if not txt:
-            continue
-        try:
-            conf = float(data["conf"][i])
-        except Exception:
-            conf = -1.0
-        if conf < OCR_MIN_WORD_CONF:
-            continue
-        x, y, w, h = int(data["left"][i]), int(data["top"][i]), int(data["width"][i]), int(data["height"][i])
-        words.append({"text": txt, "bbox": (x, y, w, h), "conf": conf})
+async def call_openai_vision_review(
+    image_bytes: bytes,
+    ocr_text: str,
+    rules_text: str,
+    model: str,
+) -> Tuple[str, str, str]:
+    """
+    Возвращает 3 текста: (что вижу), (визуал), (текст).
+    Без JSON, чтобы не ловить "invalid JSON" и ошибки формата.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
-    words.sort(key=lambda w: (w["bbox"][1], w["bbox"][0]))
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/png;base64,{b64}"
 
-    lines: List[List[Dict[str, Any]]] = []
-    cur: List[Dict[str, Any]] = []
-    last_y: Optional[int] = None
-    y_thresh = 12
-
-    for w in words:
-        y = w["bbox"][1]
-        if last_y is None or abs(y - last_y) <= y_thresh:
-            cur.append(w)
-            if last_y is None:
-                last_y = y
-        else:
-            if cur:
-                lines.append(cur)
-            cur = [w]
-            last_y = y
-    if cur:
-        lines.append(cur)
-
-    result = []
-    for ln in lines:
-        text = " ".join(w["text"] for w in ln).strip()
-        if not text:
-            continue
-        conf = sum(w["conf"] for w in ln) / max(1, len(ln))
-        if conf < OCR_MIN_CONF:
-            continue
-
-        xs = [w["bbox"][0] for w in ln]
-        ys = [w["bbox"][1] for w in ln]
-        ws = [w["bbox"][2] for w in ln]
-        hs = [w["bbox"][3] for w in ln]
-        x0, y0 = min(xs), min(ys)
-        x1 = max(xs[i] + ws[i] for i in range(len(xs)))
-        y1 = max(ys[i] + hs[i] for i in range(len(ys)))
-        result.append(
-            {
-                "text": text,
-                "bbox": (x0, y0, x1 - x0, y1 - y0),
-                "conf": conf,
-            }
-        )
-    return result
-
-# -------------------------------------------------------
-# OpenAI Responses API (Structured Outputs)
-# -------------------------------------------------------
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-
-def extract_responses_text(data: Dict[str, Any]) -> str:
-    t = data.get("output_text")
-    if isinstance(t, str) and t.strip():
-        return t.strip()
-
-    out = data.get("output", [])
-    chunks: List[str] = []
-    if isinstance(out, list):
-        for item in out:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "message":
-                for c in item.get("content", []) or []:
-                    if not isinstance(c, dict):
-                        continue
-                    if c.get("type") in ("output_text", "text"):
-                        txt = c.get("text")
-                        if isinstance(txt, str) and txt:
-                            chunks.append(txt)
-    return "".join(chunks).strip()
-
-def openai_design_review(image_png_bytes: bytes, ocr_snippet: str) -> Dict[str, Any]:
-    img_url = image_to_data_url_png(image_png_bytes)
-
+    # Жёстко задаём формат ответа: 3 секции простым текстом.
     system = (
-        "Ты — старший дизайнер (design lead) и партнёр по дизайн-ревью для банковского B2B продукта.\n"
-        "Тон: дружелюбно, но честно. Если плохо — говоришь прямо (без мата). Если хорошо — хвалишь конкретно.\n"
-        "Никаких технических деталей типа размеров/медиан/пикселей/HEX-цветов.\n"
-        "Про шрифты: можно только предположить семейство (например: Inter / SF Pro / Roboto / Helvetica / PT Sans) и сказать, что это гипотеза.\n"
-        "Структура каждого замечания: что хорошо (если есть) → что плохо → почему → что сделать.\n"
-        "Верни строго валидный JSON по схеме."
+        "Ты — придирчивый старший дизайн-ревьюер для B2B банка. "
+        "Ты честный, иногда жёсткий, но без грубости и без мата. "
+        "Если хорошо — похвали конкретно. Если плохо — ругай конкретно и предложи исправление. "
+        "НЕ используй HTML-теги. Никаких JSON, никаких словарей вида {'key': ...}."
     )
 
     user = (
-        "Сделай дизайн-ревью скриншота.\n"
-        "Нужно 3 части:\n"
-        "1) what_i_see: кратко опиши экран человеческим языком\n"
-        "2) visual_report: минимум 5 пунктов\n"
-        "3) text_report: минимум 5 пунктов\n"
-        "Поставь оценки ui/ux/copy/overall (1–10) и вердикт: что чинить первым.\n\n"
-        "OCR (может шуметь):\n"
-        f"{ocr_snippet}\n"
+        "Задача: проанализируй скрин интерфейса.\n\n"
+        "Выход: верни РОВНО три блока текста, в таком формате:\n"
+        "1) WHAT_I_SEE: 2–6 предложений, что на экране происходит.\n"
+        "2) VISUAL_REVIEW (SCORE X/10): 5–12 пунктов. Только про визуал/UX: иерархия, отступы, выравнивание, перегруз, контраст (без чисел), консистентность, читаемость. "
+        "Про шрифт — ТОЛЬКО предположение о семействе (например 'sans-serif типа Inter/SF/Roboto'), без размеров, медиан и точных цветов.\n"
+        "3) TEXT_REVIEW (SCORE Y/10): 6–14 пунктов. Каждый пункт: 'Проблема → Почему плохо → Как исправить'. "
+        "Обязательно чтобы было понятно, что именно не так и что сделать.\n\n"
+        "Контекст правил (суть):\n"
+        f"{rules_text}\n\n"
+        "Если OCR текст есть — используй его как подсказку, но приоритет у того, что видно на экране.\n"
+        f"OCR_TEXT (может быть неполный): {ocr_text or '(нет)'}\n"
     )
 
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "what_i_see": {"type": "string"},
-            "scores": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "ui": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "ux": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "copy": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "overall": {"type": "integer", "minimum": 1, "maximum": 10},
-                    "verdict": {"type": "string"},
-                },
-                "required": ["ui", "ux", "copy", "overall", "verdict"],
-            },
-            "visual_report": {
-                "type": "array",
-                "minItems": 5,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "good": {"type": "string"},
-                        "issue": {"type": "string"},
-                        "why": {"type": "string"},
-                        "fix": {"type": "string"},
-                        "priority": {"type": "string", "enum": ["high", "med", "low"]},
-                    },
-                    "required": ["good", "issue", "why", "fix", "priority"],
-                },
-            },
-            "text_report": {
-                "type": "array",
-                "minItems": 5,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "good": {"type": "string"},
-                        "issue": {"type": "string"},
-                        "why": {"type": "string"},
-                        "fix": {"type": "string"},
-                        "example": {"type": "string"},
-                        "priority": {"type": "string", "enum": ["high", "med", "low"]},
-                    },
-                    "required": ["good", "issue", "why", "fix", "example", "priority"],
-                },
-            },
-            "fonts_guess": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": ["what_i_see", "scores", "visual_report", "text_report", "fonts_guess"],
-    }
-
     payload = {
-        "model": LLM_MODEL,
-        "instructions": system,
+        "model": model,
         "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system}],
+            },
             {
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": user},
-                    {"type": "input_image", "image_url": img_url},
+                    {"type": "input_image", "image_url": data_url},
                 ],
-            }
+            },
         ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "design_review_schema_v2",
-                "schema": schema,
-            }
-        },
-        "max_output_tokens": 1500,
+        "max_output_tokens": 900,
     }
 
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    r = requests.post(OPENAI_RESPONSES_URL, headers=headers, json=payload, timeout=150)
-    r.raise_for_status()
-    data = r.json()
+    url = "https://api.openai.com/v1/responses"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
 
-    text = extract_responses_text(data)
-    if not text:
-        raise RuntimeError("Empty response text from OpenAI")
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        out = r.json()
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start : end + 1])
-        raise
+    # вытаскиваем текст из Responses API
+    text_parts = []
+    for item in out.get("output", []):
+        for c in item.get("content", []):
+            if c.get("type") == "output_text" and c.get("text"):
+                text_parts.append(c["text"])
+    full = clean_text("\n".join(text_parts))
+    if not full:
+        raise RuntimeError("LLM returned empty output")
 
-# -------------------------------------------------------
-# formatting
-# -------------------------------------------------------
-def fmt_scores(scores: Dict[str, Any]) -> str:
-    def clamp10(x):
-        try:
-            v = int(x)
-        except Exception:
-            return None
-        return max(1, min(10, v))
+    # парсим 3 секции по маркерам
+    # (делаем устойчиво: даже если модель чуть отклонится, мы вытащим максимально)
+    what = ""
+    visual = ""
+    text = ""
 
-    ui = clamp10(scores.get("ui"))
-    ux = clamp10(scores.get("ux"))
-    cp = clamp10(scores.get("copy"))
-    ov = clamp10(scores.get("overall"))
-    verdict = safe_text(scores.get("verdict")) or "Начни с основы: ясная иерархия + понятные действия."
+    # нормализуем
+    norm = full.replace("\r\n", "\n")
 
-    def bar10(v: Optional[int]) -> str:
-        if v is None:
-            return "??????????"
-        return "■" * v + "□" * (10 - v)
+    def extract_block(marker: str) -> str:
+        m = re.search(rf"{marker}\s*:\s*", norm, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        start = m.end()
+        # до следующего маркера или конец
+        next_m = re.search(r"(WHAT_I_SEE\s*:|VISUAL_REVIEW\s*\(|TEXT_REVIEW\s*\()", norm[start:], flags=re.IGNORECASE)
+        if next_m:
+            return clean_text(norm[start:start + next_m.start()])
+        return clean_text(norm[start:])
 
-    def s(v: Optional[int]) -> str:
-        return "?" if v is None else str(v)
+    what = extract_block("WHAT_I_SEE")
+    # для VISUAL/TEXT удобнее вырезать по строкам
+    # попробуем найти секции через заголовки
+    vm = re.search(r"VISUAL_REVIEW\s*\(.*?\)\s*:", norm, flags=re.IGNORECASE)
+    tm = re.search(r"TEXT_REVIEW\s*\(.*?\)\s*:", norm, flags=re.IGNORECASE)
 
-    return (
-        "<b>Оценка (1–10)</b>\n"
-        f"UI   {s(ui)}/10  <code>{bar10(ui)}</code>\n"
-        f"UX   {s(ux)}/10  <code>{bar10(ux)}</code>\n"
-        f"Copy {s(cp)}/10  <code>{bar10(cp)}</code>\n"
-        f"Итог {s(ov)}/10  <code>{bar10(ov)}</code>\n"
-        f"<b>Вердикт:</b> {htmlesc(verdict)}"
-    )
+    if vm:
+        start = vm.end()
+        end = tm.start() if tm else len(norm)
+        visual = clean_text(norm[start:end])
 
-def format_visual_report(items: List[Dict[str, Any]]) -> str:
-    pr_map = {"high": "🔴", "med": "🟠", "low": "🟡"}
-    if not items:
-        return "<b>2) Визуальная часть</b>\nНечего обсуждать: или скрин без интерфейса, или слишком мелко."
-    lines = ["<b>2) Визуальная часть</b>"]
-    for it in items[:12]:
-        pr = pr_map.get(str(it.get("priority", "med")).lower(), "🟠")
-        good = htmlesc(safe_text(it.get("good")))
-        issue = htmlesc(safe_text(it.get("issue")))
-        why = htmlesc(safe_text(it.get("why")))
-        fix = htmlesc(safe_text(it.get("fix")))
+    if tm:
+        start = tm.end()
+        text = clean_text(norm[start:])
 
-        # чуть мягче, по-дружески
-        block = f"{pr} <b>{issue}</b>"
-        if good:
-            block += f"\n— 👍 что хорошо: {good}"
-        block += f"\n— почему это важно: {why}\n— как улучшить: {fix}"
-        lines.append(block)
-    return "\n\n".join(lines)
+    # fallback: если формат не соблюдён, просто разрежем аккуратно
+    if not (what and visual and text):
+        # попробуем грубо поделить на 3 части по пустым строкам
+        parts = [p.strip() for p in re.split(r"\n\s*\n", norm) if p.strip()]
+        if not what and parts:
+            what = parts[0]
+        if not visual and len(parts) >= 2:
+            visual = parts[1]
+        if not text and len(parts) >= 3:
+            text = "\n\n".join(parts[2:])
 
-def format_text_report(items: List[Dict[str, Any]]) -> str:
-    pr_map = {"high": "🔴", "med": "🟠", "low": "🟡"}
-    if not items:
-        return "<b>3) Текст</b>\nТекста не видно. Это уже проблема: человек не понимает, что происходит."
-    lines = ["<b>3) Текст</b>"]
-    for it in items[:12]:
-        pr = pr_map.get(str(it.get("priority", "med")).lower(), "🟠")
-        good = htmlesc(safe_text(it.get("good")))
-        issue = htmlesc(safe_text(it.get("issue")))
-        why = htmlesc(safe_text(it.get("why")))
-        fix = htmlesc(safe_text(it.get("fix")))
-        ex = htmlesc(safe_text(it.get("example")))
+    return what.strip(), visual.strip(), text.strip()
 
-        block = f"{pr} <b>{issue}</b>"
-        if good:
-            block += f"\n— 👍 что хорошо: {good}"
-        block += f"\n— почему это важно: {why}\n— как улучшить: {fix}"
-        if ex:
-            block += f"\n— пример: «{ex}»"
-        lines.append(block)
-    return "\n\n".join(lines)
 
-# -------------------------------------------------------
-# handlers
-# -------------------------------------------------------
-@dp.message(CommandStart())
-async def start(m: Message):
+# ---------------------------
+# Telegram bot setup
+# ---------------------------
+
+kb = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_SEND_SCREEN)],
+        [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_PING)],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Кидай скрин — я разнесу (по делу).",
+)
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=None),  # без HTML, чтобы не ловить entity errors
+)
+dp = Dispatcher()
+
+
+@dp.message(F.text.in_({"/start", "start"}))
+async def cmd_start(m: Message):
     await m.answer(
-        "👋 Привет. Я — <b>Design Review Partner</b>.\n\n"
-        "Кидай скрин — я:\n"
-        "• расскажу, что вижу\n"
-        "• отмечу, что сделано хорошо\n"
-        "• честно скажу, что мешает UX\n"
-        "• предложу, как улучшить\n"
-        "• поставлю оценку 1–10\n\n"
-        "Давай, присылай скриншот.",
-        reply_markup=main_kb,
+        "Я — партнёр по дизайн-ревью.\n"
+        "Кидай скрин интерфейса — я придирчиво разберу UI/UX и тексты.\n\n"
+        "Жми «🖼 Закинуть скрин» или просто отправь картинку сюда.",
+        reply_markup=kb,
     )
 
-@dp.message(F.text == "ℹ️ Что умеешь?")
-async def about(m: Message):
+
+@dp.message(F.text == BTN_HELP)
+async def cmd_help(m: Message):
     await m.answer(
-        "<b>Как я работаю</b>\n"
-        "1) Ты кидаешь скрин\n"
-        "2) Я показываю прогресс ASCII-анимацией\n"
-        "3) Отправляю 4 сообщения:\n"
-        "   • что вижу\n"
-        "   • оценка и вердикт\n"
-        "   • визуал\n"
-        "   • текст\n\n"
-        "Совет: если текст мелкий — пришли скрин покрупнее."
+        "Как пользоваться:\n"
+        "1) Отправь скрин интерфейса.\n"
+        "2) Я покажу прогресс ASCII.\n"
+        "3) Потом пришлю 3 сообщения:\n"
+        "   • что вижу на экране\n"
+        "   • визуальный разбор + оценка\n"
+        "   • разбор текста + оценка\n\n"
+        "Подсказка: чем крупнее текст на скрине — тем точнее придирки.",
+        reply_markup=kb,
     )
 
-@dp.message(F.text == "🖼 Закинуть скрин и получить ревью")
+
+@dp.message(F.text == BTN_PING)
+async def cmd_ping(m: Message):
+    await m.answer(
+        f"pong ✅\n"
+        f"LLM_ENABLED={LLM_ENABLED}\n"
+        f"MODEL={LLM_MODEL}\n"
+        f"OCR_ENABLED={OCR_ENABLED} ({OCR_LANG})\n"
+        f"RULES={RULES_PATH}",
+        reply_markup=kb,
+    )
+
+
+@dp.message(F.text == BTN_SEND_SCREEN)
 async def ask_screen(m: Message):
-    await m.answer("Пришли скриншот (png/jpg).")
+    await m.answer("Ок. Кидай скриншот. Я посмотрю и докопаюсь по делу 🙂", reply_markup=kb)
 
-@dp.message(F.photo | F.document[(F.document.mime_type.startswith("image/"))])
-async def handle_image(m: Message):
-    if m.photo:
-        file_id = m.photo[-1].file_id
-    else:
-        file_id = m.document.file_id
 
-    file = await bot.get_file(file_id)
-    f = await bot.download_file(file.file_path)
-    raw = f.read()
+@dp.message(F.photo)
+async def handle_photo(m: Message):
+    # скачиваем фото (берём самое большое)
+    photo = m.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    # временный путь
+    tmp_dir = Path("/tmp")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    img_path = tmp_dir / f"tg_{photo.file_unique_id}.png"
+    await bot.download_file(file.file_path, destination=str(img_path))
 
-    img = Image.open(io.BytesIO(raw)).convert("RGB")
-    prog = await m.answer("<b>Обрабатываю…</b>\n<code>[░░░░░░░░░░░░░░░░░░░░░░] 0%</code>")
+    # Прогресс-бар ASCII (редактируем одно сообщение)
+    progress_msg = await m.answer(ascii_progress_frame(1, label="Загружаю"), reply_markup=kb)
+
+    # читаем байты
+    image_bytes = img_path.read_bytes()
+
+    # OCR (опционально)
+    await progress_msg.edit_text(ascii_progress_frame(3, label="Достаю текст (OCR)"))
+    ocr_text = ocr_extract_text(str(img_path))
+
+    # Угадаем “семейство шрифта” очень мягко (и честно)
+    font_guess = guess_font_family_from_image_text(ocr_text)
+
+    # LLM review
+    if not LLM_ENABLED:
+        await progress_msg.edit_text(ascii_progress_frame(10, label="Готово"))
+        await m.answer(
+            "LLM выключен (LLM_ENABLED=false).\n"
+            "Я сейчас могу сделать только OCR-сводку.\n\n"
+            f"Текст (OCR): {ocr_text or '(не извлёк)'}\n"
+            f"Шрифт (предположение): {font_guess}",
+            reply_markup=kb,
+        )
+        return
+
+    await progress_msg.edit_text(ascii_progress_frame(5, label="Думаю (LLM)"))
 
     try:
-        await animate_stage(prog, "Загрузка", 3, 18, "Принял скрин. Сейчас посмотрим.", steps=8)
-        await animate_stage(prog, "OCR", 20, 45, "Вытаскиваю текст (где получится).", steps=9)
-
-        lines = ocr_lines(img)
-        ocr_texts = [ln["text"] for ln in lines[:30]]
-        ocr_snippet = "\n".join(f"- {t}" for t in ocr_texts) if ocr_texts else "(текст почти не читается / мало текста)"
-
-        await animate_stage(prog, "Ревью", 48, 88, "Собираю мысли. Буду честным.", steps=12)
-
-        review = await asyncio.to_thread(openai_design_review, raw, ocr_snippet)
-
-        await animate_stage(prog, "Финал", 90, 99, "Оформляю отчёт.", steps=7)
-
-        what = safe_text(review.get("what_i_see")) or "Не смог уверенно понять, что на экране."
-        scores = review.get("scores") if isinstance(review.get("scores"), dict) else {}
-        visual_items = review.get("visual_report") if isinstance(review.get("visual_report"), list) else []
-        text_items = review.get("text_report") if isinstance(review.get("text_report"), list) else []
-        fonts_guess = safe_list(review.get("fonts_guess"))
-
-        msg1 = "<b>1) Что я вижу на скриншоте</b>\n" + htmlesc(what)
-        if fonts_guess:
-            msg1 += "\n\n<b>Шрифт (гипотеза)</b>: " + htmlesc(", ".join(map(str, fonts_guess[:4])))
-
-        msg_scores = fmt_scores(scores)
-        msg2 = format_visual_report(visual_items)
-        msg3 = format_text_report(text_items)
-
-        await progress_edit(prog, "Готово", 100, "Отправляю. Без сахара, но по делу.", tick=13)
-
-        await m.answer(msg1)
-        await m.answer(msg_scores)
-        await m.answer(msg2)
-        await m.answer(msg3)
-
-    except requests.HTTPError as e:
-        body = ""
-        try:
-            body = e.response.text[:900]
-        except Exception:
-            pass
-        await prog.edit_text(f"⚠️ Ошибка запроса к LLM: {htmlesc(str(e))}\n<code>{htmlesc(body)}</code>")
+        what, visual, text = await call_openai_vision_review(
+            image_bytes=image_bytes,
+            ocr_text=ocr_text,
+            rules_text=RULES_TEXT,
+            model=LLM_MODEL,
+        )
+    except httpx.HTTPStatusError as e:
+        await progress_msg.edit_text(ascii_progress_frame(10, label="Упс"))
+        await m.answer(
+            f"⚠️ Ошибка запроса к LLM: {e.response.status_code}\n"
+            f"{clean_text(e.response.text)[:1200]}",
+            reply_markup=kb,
+        )
+        return
     except Exception as e:
-        await prog.edit_text(f"⚠️ Упало при обработке: {htmlesc(str(e))}")
+        await progress_msg.edit_text(ascii_progress_frame(10, label="Упс"))
+        await m.answer(f"⚠️ Упало при обработке: {e}", reply_markup=kb)
+        return
 
-# -------------------------------------------------------
-# run
-# -------------------------------------------------------
+    await progress_msg.edit_text(ascii_progress_frame(10, label="Готово"))
+
+    # 1) что вижу
+    await m.answer(
+        "👀 Что я вижу на скрине:\n"
+        f"{what}\n\n"
+        f"Шрифт (предположение): {font_guess}",
+        reply_markup=kb,
+    )
+
+    # 2) визуал
+    await m.answer(
+        "🎛 Визуальный разбор:\n"
+        f"{visual}",
+        reply_markup=kb,
+    )
+
+    # 3) текст
+    await m.answer(
+        "✍️ Разбор текста:\n"
+        f"{text}",
+        reply_markup=kb,
+    )
+
+
+@dp.message()
+async def fallback(m: Message):
+    await m.answer(
+        "Я понимаю либо команды, либо картинку.\n"
+        "Кидай скриншот интерфейса — и я устрою ревью.",
+        reply_markup=kb,
+    )
+
+
+async def main():
+    print(f"✅ Bot starting… LLM_ENABLED={LLM_ENABLED}, model={LLM_MODEL}, OCR_ENABLED={OCR_ENABLED}, rules={RULES_PATH}")
+    await dp.start_polling(bot)
+
+
 if __name__ == "__main__":
-    print(f"✅ Design Review Partner starting… OCR_LANG={OCR_LANG}, model={LLM_MODEL}")
-    asyncio.run(dp.start_polling(bot))
+    asyncio.run(main())
