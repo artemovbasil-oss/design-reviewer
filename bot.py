@@ -1,3 +1,9 @@
+# bot.py — Design Review Partner (aiogram 3.7.0)
+# - ASCII прогресс с fallback (если edit нельзя, создаём 1 новый прогресс-месседж и редактируем его)
+# - Hybrid: OCR (если доступен) -> иначе LLM "extract"
+# - 3 итоговых сообщения: что вижу / визуал (оценка) / тексты
+# - Без тех. деталей (px/цвет-коды), шрифты/палитра — только догадки
+
 import os
 import re
 import json
@@ -5,7 +11,7 @@ import base64
 import asyncio
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List
 
 from PIL import Image
 
@@ -19,22 +25,22 @@ from openai import OpenAI
 
 # OCR (optional)
 try:
-    import pytesseract
-    OCR_AVAILABLE = True
+    import pytesseract  # type: ignore
+    OCR_PY_AVAILABLE = True
 except Exception:
-    OCR_AVAILABLE = False
+    OCR_PY_AVAILABLE = False
 
 # optional OpenCV for better OCR
 try:
-    import cv2
-    import numpy as np
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
     CV_AVAILABLE = True
 except Exception:
     CV_AVAILABLE = False
 
 
 # =============================
-# Optional local .env loader (NO python-dotenv dependency)
+# Local .env loader (no python-dotenv)
 # =============================
 def load_local_env_file() -> None:
     env_path = Path(__file__).with_name(".env")
@@ -80,7 +86,7 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_HELP), KeyboardButton(text=BTN_PING)],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Кидай скрин — разберу по делу, без сюсюканья.",
+    input_field_placeholder="Кидай скрин — я разберу его по-взрослому.",
 )
 
 bot = Bot(
@@ -89,7 +95,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# per-chat lock
+# per-chat lock (чтобы прогресс/ответы не путались)
 _CHAT_LOCKS: Dict[int, asyncio.Lock] = {}
 
 
@@ -126,7 +132,7 @@ def img_to_base64_png(image: Image.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def ascii_frame(i: int) -> str:
+def ascii_bar(i: int) -> str:
     frames = [
         "▱▱▱▱▱",
         "▰▱▱▱▱",
@@ -139,29 +145,8 @@ def ascii_frame(i: int) -> str:
     return frames[max(0, min(i, len(frames) - 1))]
 
 
-def spinner_frame(i: int) -> str:
-    sp = ["|", "/", "—", "\\"]
-    return sp[i % len(sp)]
-
-
-async def safe_edit_text(msg: Message, text: str) -> bool:
-    try:
-        await msg.edit_text(text)
-        return True
-    except TelegramBadRequest:
-        return False
-
-
-async def animate_progress(msg: Message, title: str = "🔍 Смотрю внимательно…") -> None:
-    for i in range(6):
-        ok = await safe_edit_text(msg, f"{title} {spinner_frame(i)}\n<code>{ascii_frame(i)}</code>")
-        if not ok:
-            break
-        await asyncio.sleep(0.22)
-
-
-async def progress_set(msg: Message, title: str, i: int) -> None:
-    await safe_edit_text(msg, f"{title} {spinner_frame(i)}\n<code>{ascii_frame(i)}</code>")
+def spinner(i: int) -> str:
+    return ["|", "/", "—", "\\"][i % 4]
 
 
 def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
@@ -176,107 +161,180 @@ def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
 
 
 # =============================
-# OCR pipeline (hybrid restore)
+# Progress animation (no-spam but always visible)
+# =============================
+async def safe_edit_text_or_recreate(msg: Message, text: str) -> Message:
+    """
+    Пытаемся отредактировать msg.
+    Если Telegram не даёт редактировать (message can't be edited) —
+    создаём ОДНО новое прогресс-сообщение и продолжаем на нём.
+    """
+    try:
+        await msg.edit_text(text)
+        return msg
+    except TelegramBadRequest:
+        try:
+            new_msg = await msg.answer(text)
+            return new_msg
+        except TelegramBadRequest:
+            return msg
+
+
+async def animate_progress(msg: Message, title: str = "🔍 Смотрю внимательно…") -> Message:
+    current = msg
+    for i in range(10):
+        bar = ascii_bar(min(i, 6))
+        frame = f"{title} {spinner(i)}\n<pre>{bar}</pre>"
+        current = await safe_edit_text_or_recreate(current, frame)
+        await asyncio.sleep(0.22)
+    return current
+
+
+async def set_progress(msg: Message, title: str, step: int) -> Message:
+    bar = ascii_bar(step)
+    frame = f"{title} {spinner(step)}\n<pre>{bar}</pre>"
+    return await safe_edit_text_or_recreate(msg, frame)
+
+
+# =============================
+# OCR pipeline (best effort)
 # =============================
 def preprocess_for_ocr(pil: Image.Image) -> Image.Image:
-    """
-    Улучшает контраст/читаемость для OCR.
-    Если нет OpenCV — возвращает как есть.
-    """
     if not CV_AVAILABLE:
         return pil.convert("RGB")
 
     img = np.array(pil.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    # лёгкая нормализация
     gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
-    # адаптивный порог
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                cv2.THRESH_BINARY, 31, 8)
+    thr = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 8
+    )
     return Image.fromarray(thr)
 
 
 def ocr_extract(pil: Image.Image) -> Dict[str, Any]:
     """
-    Возвращает:
+    Returns:
     {
-      "ok": bool,
-      "text": str,
-      "blocks": [ { "text": str, "bbox": [x,y,w,h], "kind_guess": str } ... ]
+      ok: bool,
+      text: str,
+      blocks: [ {text, kind_guess} ... ]  # bbox intentionally removed for simplicity
     }
     """
-    if not OCR_AVAILABLE:
+    if not OCR_PY_AVAILABLE:
         return {"ok": False, "reason": "pytesseract not installed", "text": "", "blocks": []}
 
-    # если tesseract binary отсутствует — pytesseract кинет ошибку
     try:
         img = preprocess_for_ocr(pil)
-        # data gives word-level boxes; we'll aggregate to line-ish blocks using 'line_num'
         data = pytesseract.image_to_data(img, lang=OCR_LANG, output_type=pytesseract.Output.DICT)
     except Exception as e:
+        # Most common on Railway: tesseract binary missing
         return {"ok": False, "reason": f"tesseract error: {e}", "text": "", "blocks": []}
 
     n = len(data.get("text", []))
-    blocks_map: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-
-    full_text_parts: List[str] = []
+    lines: Dict[str, List[str]] = {}
+    full_words: List[str] = []
 
     for i in range(n):
         txt = (data["text"][i] or "").strip()
-        conf = float(data.get("conf", ["-1"])[i]) if "conf" in data else -1.0
         if not txt:
             continue
-        if conf >= 0:
-            # фильтр по уверенности, но не слишком агрессивно
-            if conf < 35:
-                continue
+        conf = -1.0
+        try:
+            conf = float(data.get("conf", ["-1"])[i])
+        except Exception:
+            pass
+        if conf >= 0 and conf < 35:
+            continue
 
-        full_text_parts.append(txt)
-
-        key = (data.get("block_num", [0])[i], data.get("par_num", [0])[i], data.get("line_num", [0])[i])
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-
-        rec = blocks_map.get(key)
-        if not rec:
-            blocks_map[key] = {
-                "text": [txt],
-                "bbox": [x, y, w, h],
-            }
-        else:
-            rec["text"].append(txt)
-            bx, by, bw, bh = rec["bbox"]
-            # union bbox
-            x2 = max(bx + bw, x + w)
-            y2 = max(by + bh, y + h)
-            nx = min(bx, x)
-            ny = min(by, y)
-            rec["bbox"] = [nx, ny, x2 - nx, y2 - ny]
+        full_words.append(txt)
+        key = f"{data.get('block_num',[0])[i]}:{data.get('par_num',[0])[i]}:{data.get('line_num',[0])[i]}"
+        lines.setdefault(key, []).append(txt)
 
     blocks = []
-    for rec in blocks_map.values():
-        line = " ".join(rec["text"]).strip()
+    for _, words in lines.items():
+        line = " ".join(words).strip()
         if not line:
             continue
-        x, y, w, h = rec["bbox"]
-        # очень грубая догадка типа элемента по геометрии/форме/длине
+        # Very rough guess
         kind = "text"
-        if len(line) <= 20 and h >= 28:
+        if len(line) <= 20:
             kind = "title_or_button"
-        if len(line) <= 14 and w <= 220 and h >= 30:
+        if len(line) <= 14:
             kind = "button_like"
-        blocks.append({"text": line, "bbox": [x, y, w, h], "kind_guess": kind})
+        blocks.append({"text": line, "kind_guess": kind})
 
-    return {"ok": True, "text": " ".join(full_text_parts).strip(), "blocks": blocks}
+    return {"ok": True, "text": " ".join(full_words).strip(), "blocks": blocks}
 
 
 # =============================
-# LLM (hybrid: image + OCR)
+# LLM: extract (fallback when OCR fails)
 # =============================
-def analyze_ui_with_openai(image_b64: str, ocr: Dict[str, Any]) -> Dict[str, Any]:
-    ocr_text = (ocr.get("text") or "").strip()
-    blocks = ocr.get("blocks") or []
+def llm_extract_text_structure(image_b64: str) -> Dict[str, Any]:
+    """
+    Fallback when OCR isn't available: ask LLM to extract text blocks.
+    Returns:
+      { ok: bool, text: str, blocks: [{text, kind_guess}] }
+    """
+    prompt = """
+Ты видишь скрин интерфейса. Твоя задача — вытащить текст и понять структуру.
+Верни СТРОГО JSON:
+{
+  "text": "весь текст на экране одной строкой (если что-то не читается — пропусти)",
+  "blocks": [
+    {"text":"...", "kind_guess":"title_or_button|button_like|text|hint|status"},
+    ...
+  ]
+}
+Без лишних ключей. Без пояснений. Только JSON.
+"""
+    resp = client.responses.create(
+        model=LLM_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_base64": image_b64},
+                ],
+            }
+        ],
+        max_output_tokens=700,
+    )
 
-    # ограничим размер, чтобы не улететь по токенам
+    out_text = ""
+    for item in getattr(resp, "output", []) or []:
+        for c in item.content or []:
+            if getattr(c, "type", None) == "output_text":
+                out_text += getattr(c, "text", "") + "\n"
+
+    data = parse_llm_json(out_text.strip())
+    if not data:
+        return {"ok": False, "text": "", "blocks": []}
+
+    text = str(data.get("text", "")).strip()
+    blocks = data.get("blocks", [])
+    if not isinstance(blocks, list):
+        blocks = []
+    cleaned = []
+    for b in blocks[:80]:
+        if not isinstance(b, dict):
+            continue
+        t = str(b.get("text", "")).strip()
+        if not t:
+            continue
+        k = str(b.get("kind_guess", "text")).strip()
+        cleaned.append({"text": t, "kind_guess": k})
+
+    return {"ok": True, "text": text, "blocks": cleaned}
+
+
+# =============================
+# LLM: review (image + extracted text)
+# =============================
+def analyze_ui_with_openai(image_b64: str, extracted: Dict[str, Any]) -> Dict[str, Any]:
+    ocr_text = (extracted.get("text") or "").strip()
+    blocks = extracted.get("blocks") or []
     blocks_short = blocks[:80]
 
     prompt = f"""
@@ -284,17 +342,16 @@ def analyze_ui_with_openai(image_b64: str, ocr: Dict[str, Any]) -> Dict[str, Any
 Говоришь по-русски. Без мата. Без сюсюканья.
 Если хорошо — хвали конкретно. Если плохо — ругай конкретно и предлагай улучшения.
 
-Важно:
+Ограничения:
 - Никаких технических деталей (пиксели, коды цветов, расчёты).
 - Про шрифт/палитру — только предположения ("похоже на sans-serif типа Inter/SF/Roboto").
-- Учитывай контекст. Не путай заголовки и кнопки. Не выдумывай то, чего нет.
-- Для текста ориентируйся на OCR-данные ниже, но сверяй с картинкой.
+- Не путай заголовки и кнопки. Сверяйся с картинкой и блоками текста.
+- Не выдумывай элементы.
 
-OCR_STATUS: {"OK" if ocr.get("ok") else "FAIL"}
-OCR_TEXT (может быть неполным):
-{ocr_text[:1800]}
+Извлечённый текст:
+{ocr_text[:2000]}
 
-OCR_BLOCKS (список строк с bbox и грубым guess):
+Блоки (строки) с грубым guess:
 {json.dumps(blocks_short, ensure_ascii=False)}
 
 Верни СТРОГО JSON:
@@ -329,8 +386,9 @@ OCR_BLOCKS (список строк с bbox и грубым guess):
     out_text = out_text.strip()
     data = parse_llm_json(out_text)
     if not data:
+        # fallback: plain text without dict junk
         return {
-            "description": (out_text[:900] or "Модель вернула пустой ответ."),
+            "description": (out_text[:900] or "Не смог собрать отчёт из ответа модели."),
             "score": 5,
             "visual": "—",
             "text": "—",
@@ -355,7 +413,7 @@ async def start(m: Message):
         "1) скажу, что вижу\n"
         "2) разнесу (или похвалю) визуал\n"
         "3) разнесу (или похвалю) тексты\n\n"
-        "Нажми кнопку снизу или просто отправь картинку.",
+        "Жми кнопку снизу или просто отправь картинку.",
         reply_markup=keyboard,
     )
 
@@ -375,7 +433,7 @@ async def help_msg(m: Message):
 @dp.message(F.text == BTN_PING)
 async def ping(m: Message):
     await m.answer(
-        f"pong ✅\nMODEL: <code>{html_escape(LLM_MODEL)}</code>\nOCR: <code>{'on' if OCR_AVAILABLE else 'off'}</code>",
+        f"pong ✅\nMODEL: <code>{html_escape(LLM_MODEL)}</code>\nOCR(py): <code>{'on' if OCR_PY_AVAILABLE else 'off'}</code>",
         reply_markup=keyboard,
     )
 
@@ -399,8 +457,9 @@ async def handle_photo(m: Message):
         return
 
     async with lock:
-        progress = await m.answer("⏳ Принял. Загружаю…", reply_markup=keyboard)
-        await animate_progress(progress, title="🔍 Смотрю внимательно…")
+        # 1) Initial progress (без клавиатуры — меньше шансов, что Telegram запретит edit)
+        progress = await m.answer("⏳ Принял. Загружаю…")
+        progress = await animate_progress(progress, title="🔍 Смотрю внимательно…")
 
         photo = m.photo[-1]
         file = await bot.get_file(photo.file_id)
@@ -415,45 +474,55 @@ async def handle_photo(m: Message):
             await m.answer("⚠️ Не смог открыть картинку. Пришли другой файл.", reply_markup=keyboard)
             return
 
-        # OCR stage
-        await progress_set(progress, "🧾 Читаю текст…", 3)
+        # 2) Upscale small images (helps both OCR and vision)
+        w, h = img.size
+        if max(w, h) < 1400:
+            img = img.resize((w * 2, h * 2), Image.LANCZOS)
+
+        img_b64 = img_to_base64_png(img)
+
+        # 3) Extract text/structure (OCR first)
+        progress = await set_progress(progress, "🧾 Читаю текст…", 3)
+
+        extracted = {"ok": False, "text": "", "blocks": []}
         ocr = ocr_extract(img)
+        if ocr.get("ok") and (len((ocr.get("text") or "").strip()) >= 12):
+            extracted = {"ok": True, "text": ocr.get("text", ""), "blocks": ocr.get("blocks", [])}
+        else:
+            # LLM extract fallback
+            extracted = llm_extract_text_structure(img_b64)
+            if not extracted.get("ok"):
+                # last resort: keep what OCR gave (even if weak)
+                extracted = {"ok": False, "text": ocr.get("text", ""), "blocks": ocr.get("blocks", [])}
 
-        # если OCR провалился — сообщим коротко (без тех. деталей), но не остановим анализ
-        if not ocr.get("ok"):
-            # не спамим: просто добавим отдельное дружелюбное сообщение
-            await m.answer(
-                "⚠️ Текст на скрине читается плохо (или OCR недоступен). "
-                "Я всё равно попробую разобрать по картинке, но точность может просесть.",
-                reply_markup=keyboard,
-            )
-
-        await progress_set(progress, "🧠 Думаю…", 5)
+        # 4) Review
+        progress = await set_progress(progress, "🧠 Думаю…", 5)
 
         try:
-            result = analyze_ui_with_openai(img_to_base64_png(img), ocr)
+            result = analyze_ui_with_openai(img_b64, extracted)
         except Exception:
             await m.answer(
-                "⚠️ Я не смог нормально разобрать этот экран.\n\n"
-                "Чаще всего это из-за:\n"
-                "• слишком мелкого/размытого текста\n"
-                "• сильной перегруженности экрана\n"
-                "• обрезанного интерфейса\n\n"
-                "Сделай так:\n"
-                "— пришли скрин крупнее\n"
-                "— обрежь лишнее вокруг\n"
-                "— если это веб: зум 125–150% и пересними",
+                "⚠️ Упал на анализе.\n\n"
+                "Скорее всего:\n"
+                "• слишком мелкий текст\n"
+                "• экран перегружен\n"
+                "• часть интерфейса обрезана\n\n"
+                "Попробуй:\n"
+                "— скрин крупнее\n"
+                "— обрезать лишнее вокруг\n"
+                "— на вебе: зум 125–150% и переснять",
                 reply_markup=keyboard,
             )
             return
 
-        await progress_set(progress, "✅ Готово.", 6)
+        progress = await set_progress(progress, "✅ Готово.", 6)
 
         desc = html_escape(result.get("description", "")) or "—"
         visual = html_escape(result.get("visual", "")) or "—"
         text = html_escape(result.get("text", "")) or "—"
         score = clamp_score(result.get("score", 6))
 
+        # 5) Final 3 messages (+ keyboard again)
         await m.answer(f"👀 <b>Что я вижу</b>\n{desc}", reply_markup=keyboard)
         await m.answer(f"🎛 <b>Визуал</b> — оценка: <b>{score}/10</b>\n{visual}", reply_markup=keyboard)
         await m.answer(f"✍️ <b>Тексты</b>\n{text}", reply_markup=keyboard)
@@ -469,7 +538,7 @@ async def fallback(m: Message):
 
 
 async def main():
-    print(f"✅ Design Review Partner starting… model={LLM_MODEL}, OCR_AVAILABLE={OCR_AVAILABLE}, CV_AVAILABLE={CV_AVAILABLE}")
+    print(f"✅ Design Review Partner starting… model={LLM_MODEL}, OCR_PY={OCR_PY_AVAILABLE}, CV={CV_AVAILABLE}")
     await dp.start_polling(bot)
 
 
