@@ -3,18 +3,21 @@
 
 """
 Design Reviewer Telegram bot (aiogram 3.7+)
+
 - Accepts: screenshots (photo / image document) and public Figma frame links
 - Outputs 4 messages per review:
   1) What I see
   2) Verdict + recommendations (UX + Text)
   3) Annotated screenshot (OCR text blocks numbered)
-  4) ASCII concept (monospace, fixed width — no ugly wrapping on phone)
+  4) ASCII concept (monospace, fixed width — NO line wrapping)
+
 - Has:
-  - Retro ASCII progress animation (compact)
+  - Retro ASCII progress animation (compact + fast)
   - Cancel button during processing
   - Main menu only after /start and at the end of each review
   - Language toggle EN/RU (EN default)
   - Channel button @prodooktovy
+
 Notes:
 - No python-dotenv dependency. Uses environment variables only.
 - Uses OpenAI Responses API via aiohttp (no httpx/requests requirement).
@@ -38,7 +41,7 @@ from PIL import Image, ImageDraw, ImageFont
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import CommandStart
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -62,10 +65,14 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
 OCR_LANG = os.getenv("OCR_LANG", "rus+eng").strip()
 
-OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "40"))
+OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "45"))
 MAX_IMAGE_W_LLM = int(os.getenv("MAX_IMAGE_W_LLM", "1600"))
-ASCII_WIDTH = int(os.getenv("ASCII_WIDTH", "34"))  # tuned for phone width
-PROGRESS_EDIT_INTERVAL = 0.35
+
+# ✅ Phone-friendly: keep it tight. 32–36 usually safe on iPhone.
+ASCII_WIDTH = int(os.getenv("ASCII_WIDTH", "34"))
+
+# ✅ Faster and smoother retro progress
+PROGRESS_EDIT_INTERVAL = float(os.getenv("PROGRESS_EDIT_INTERVAL", "0.22"))
 
 # ---------------------------
 # Optional OCR
@@ -134,84 +141,58 @@ def cancel_inline_kb(chat_id: int) -> InlineKeyboardMarkup:
 
 
 # ---------------------------
-# ASCII animation (compact + retro) — FIXED (triple-quoted strings)
+# ASCII progress animation (compact retro bar)
 # ---------------------------
 
-FRAMES = [
-    r"""┌──────────────────┐
-│  SCANNING  .      │
-│  [=         ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  ..     │
-│  [==        ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  ...    │
-│  [===       ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  ....   │
-│  [====      ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  .....  │
-│  [=====     ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  ...... │
-│  [======    ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  ...... │
-│  [=======   ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  .....  │
-│  [========  ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  ....   │
-│  [========= ]     │
-└──────────────────┘""",
-    r"""┌──────────────────┐
-│  SCANNING  ...    │
-│  [==========]     │
-└──────────────────┘""",
-]
+def _retro_bar(i: int) -> str:
+    """
+    Compact 3-line retro scanner:
+    - fixed width inside <pre>
+    - visually nice
+    """
+    # inner bar length (not counting brackets)
+    bar_len = 18
+    pos = i % (bar_len * 2)
+    if pos >= bar_len:
+        pos = (bar_len - 1) - (pos - bar_len)
+
+    # moving "█" head + tail
+    bar = ["·"] * bar_len
+    bar[pos] = "█"
+    if pos - 1 >= 0:
+        bar[pos - 1] = "▓"
+    if pos + 1 < bar_len:
+        bar[pos + 1] = "▓"
+
+    pct = int((i % 20) * 5)  # 0..95 fake-ish
+    line1 = "┌────────────────────┐"
+    line2 = f"│ [{''.join(bar)}] {pct:>3}% │"
+    line3 = "└────────────────────┘"
+    return "\n".join([line1, line2, line3])
 
 
 async def animate_progress(anchor: Message, title: str, chat_id: int) -> Message:
     """
-    Sends 1 progress message and edits it with ASCII frames.
-    Compact to avoid chat spam.
+    Sends 1 progress message and edits it with compact retro frames.
     """
     msg = await anchor.answer(
-        f"{h(title)}\n<pre>{h(FRAMES[0])}</pre>",
+        f"{h(title)}\n<pre>{h(_retro_bar(0))}</pre>",
         reply_markup=cancel_inline_kb(chat_id),
         disable_web_page_preview=True,
     )
 
     async def _runner():
         i = 0
-        last = 0.0
         while True:
-            now = time.time()
-            if now - last < PROGRESS_EDIT_INTERVAL:
-                await asyncio.sleep(0.05)
-                continue
-            last = now
-            frame = FRAMES[i % len(FRAMES)]
-            i += 1
             try:
                 await msg.edit_text(
-                    f"{h(title)}\n<pre>{h(frame)}</pre>",
+                    f"{h(title)}\n<pre>{h(_retro_bar(i))}</pre>",
                     reply_markup=cancel_inline_kb(chat_id),
                     disable_web_page_preview=True,
                 )
             except Exception:
-                # Sometimes Telegram rejects edits; ignore
                 pass
+            i += 1
             await asyncio.sleep(PROGRESS_EDIT_INTERVAL)
 
     task = asyncio.create_task(_runner())
@@ -260,6 +241,7 @@ FIGMA_URL_RE = re.compile(r"(https?://www\.figma\.com/(file|design)/[^\s]+)", re
 async def fetch_figma_preview_image(figma_url: str) -> Tuple[Optional[bytes], Optional[str]]:
     """
     Fetches thumbnail via Figma oEmbed (public files).
+    Cache-busting to avoid "same preview for different node-id".
     Returns (image_bytes, title) or (None, None).
     """
     sep = "&" if "?" in figma_url else "?"
@@ -372,31 +354,34 @@ def join_box_snippets(boxes: List[TextBox], max_items: int = 24) -> str:
 
 
 # ---------------------------
-# ASCII concept helpers
+# ASCII concept helpers (NO WRAP, ONLY CLAMP)
 # ---------------------------
 
-def wrap_ascii_lines(s: str, width: int) -> str:
-    out_lines = []
+def clamp_ascii_width(s: str, width: int) -> str:
+    """
+    Ensure each line length <= width.
+    No wrapping. If longer -> cut (keeps monospace tidy on phone).
+    """
+    out_lines: List[str] = []
     for line in s.splitlines():
         if len(line) <= width:
             out_lines.append(line)
-            continue
-        for i in range(0, len(line), width):
-            out_lines.append(line[i:i + width])
-    return "\n".join(out_lines)
+        else:
+            out_lines.append(line[:width])
+    return "\n".join(out_lines).strip()
 
 
 def fallback_concept_ascii(width: int) -> str:
     base = [
         "┌" + "─" * (width - 2) + "┐",
-        "│" + "  CLEANER HIERARCHY".ljust(width - 2) + "│",
-        "│" + "  • 1 primary action".ljust(width - 2) + "│",
-        "│" + "  • fewer competing labels".ljust(width - 2) + "│",
-        "│" + "  • consistent spacing".ljust(width - 2) + "│",
-        "│" + "  • calmer copy".ljust(width - 2) + "│",
+        "│" + " CLEANER HIERARCHY".ljust(width - 2) + "│",
+        "│" + " • 1 primary action".ljust(width - 2) + "│",
+        "│" + " • fewer competing labels".ljust(width - 2) + "│",
+        "│" + " • consistent spacing".ljust(width - 2) + "│",
+        "│" + " • calmer copy".ljust(width - 2) + "│",
         "│" + "".ljust(width - 2) + "│",
-        "│" + "  [ PRIMARY ]".ljust(width - 2) + "│",
-        "│" + "  secondary link".ljust(width - 2) + "│",
+        "│" + " [ PRIMARY ]".ljust(width - 2) + "│",
+        "│" + " secondary link".ljust(width - 2) + "│",
         "└" + "─" * (width - 2) + "┘",
     ]
     return "\n".join(base)
@@ -414,29 +399,29 @@ def build_prompt(chat_id: int, ocr_snippet: str) -> str:
         chat_id,
         en=(
             "You are a senior product designer doing a tough, helpful design review.\n"
-            "Be honest, a bit strict, but not rude. No profanity.\n"
-            "Only use black/white emojis (e.g., ✅ ❌ ⚠️). Keep it practical.\n\n"
-            "Rules:\n"
+            "Be honest and strict, but not rude. No profanity.\n"
+            "Use only black/white emojis (✅ ❌ ⚠️). Keep it practical.\n\n"
+            "Output rules:\n"
             "- Do NOT output JSON.\n"
-            "- Use exactly these 4 sections, with the exact headers:\n"
+            "- Use exactly these 4 sections with exact headers:\n"
             "===WHAT_I_SEE===\n"
             "===VERDICT_AND_RECOMMENDATIONS===\n"
             "===TEXT_ISSUES_AND_FIXES===\n"
             "===ASCII_CONCEPT===\n\n"
             "Requirements:\n"
             "- Give an overall score 0–10.\n"
-            "- Fonts/palette: only GUESS the font family vibe (e.g., 'looks like Inter/SF/Roboto'), no pixel sizes, no color values.\n"
-            "- If something is good, praise it and say what exactly.\n"
-            "- If something is bad, call it out clearly and propose fixes.\n"
-            f"- ASCII_CONCEPT must be neat monospace, max line length {ASCII_WIDTH} chars.\n\n"
+            "- Fonts/palette: only GUESS font family vibe (e.g., Inter/SF/Roboto). No sizes, no color values.\n"
+            "- If something is good: praise it and say what exactly is good.\n"
+            "- If something is bad: call it out clearly and propose fixes.\n"
+            f"- ASCII_CONCEPT: monospace. Each line MUST be <= {ASCII_WIDTH} characters. NO long lines.\n\n"
             "OCR snippet (may be incomplete):\n"
             f"{ocr_snippet}\n"
         ),
         ru=(
             "Ты — сеньор продуктовый дизайнер, делаешь жёсткое, но полезное ревью.\n"
-            "Честно, строго, но без хамства и без мата.\n"
+            "Честно и строго, но без хамства и без мата.\n"
             "Эмодзи только ч/б (✅ ❌ ⚠️). Практика важнее поэзии.\n\n"
-            "Правила:\n"
+            "Правила вывода:\n"
             "- НЕ выводи JSON.\n"
             "- Ровно 4 секции с такими заголовками:\n"
             "===WHAT_I_SEE===\n"
@@ -445,10 +430,10 @@ def build_prompt(chat_id: int, ocr_snippet: str) -> str:
             "===ASCII_CONCEPT===\n\n"
             "Требования:\n"
             "- Общая оценка 0–10.\n"
-            "- Про шрифты/палитру: только предположение про семейство (Inter/SF/Roboto и т.п.), без размеров/цветов.\n"
+            "- Шрифты/палитра: только предположение про семейство (Inter/SF/Roboto и т.п.), без размеров/цветов.\n"
             "- Если хорошо — похвали и скажи, что именно.\n"
             "- Если плохо — назови косяк и предложи улучшение.\n"
-            f"- ASCII_CONCEPT — моноширинный блок, длина строки максимум {ASCII_WIDTH} символов.\n\n"
+            f"- ASCII_CONCEPT: моноширинный. Каждая строка ДОЛЖНА быть <= {ASCII_WIDTH} символов. БЕЗ длинных строк.\n\n"
             "OCR-сниппет (может быть неполным):\n"
             f"{ocr_snippet}\n"
         ),
@@ -473,7 +458,7 @@ async def openai_review(chat_id: int, img_bytes: bytes, ocr_snippet: str) -> Tup
                 ],
             }
         ],
-        "max_output_tokens": 900,
+        "max_output_tokens": 950,
     }
 
     headers = {
@@ -528,7 +513,8 @@ async def openai_review(chat_id: int, img_bytes: bytes, ocr_snippet: str) -> Tup
     if not concept:
         concept = fallback_concept_ascii(ASCII_WIDTH)
 
-    concept = wrap_ascii_lines(concept, ASCII_WIDTH)
+    # ✅ critical: NO wrapping, only clamp each line length
+    concept = clamp_ascii_width(concept, ASCII_WIDTH)
 
     if not (what_i_see and verdict and text_issues):
         raise RuntimeError("LLM output missing sections")
@@ -536,20 +522,20 @@ async def openai_review(chat_id: int, img_bytes: bytes, ocr_snippet: str) -> Tup
     return what_i_see, verdict, text_issues, concept
 
 
-def fallback_review(chat_id: int, boxes: List[TextBox]) -> Tuple[str, str, str, str]:
+def fallback_review(chat_id: int, boxes: List["TextBox"]) -> Tuple[str, str, str, str]:
     snippet = join_box_snippets(boxes) if boxes else ""
     what_i_see = t(
         chat_id,
-        en="I can’t run full AI review right now. I extracted visible text blocks and will comment based on that.",
-        ru="Сейчас не могу сделать полный AI-разбор. Я вытащил видимые текстовые блоки и дам комментарии по ним.",
+        en="I can’t run full AI review right now. I extracted text blocks and will comment based on that.",
+        ru="Сейчас не могу сделать полный AI-разбор. Я вытащил текстовые блоки и дам комментарии по ним.",
     )
 
     verdict = t(
         chat_id,
         en=(
             "Score: 5/10\n"
-            "✅ Good: you shipped something — but it needs cleanup.\n"
-            "❌ Issues: unclear hierarchy + too many competing messages.\n"
+            "✅ Good: you shipped something.\n"
+            "❌ Issues: hierarchy is fuzzy + too many competing messages.\n"
             "Fix:\n"
             "1) One primary action per screen.\n"
             "2) Shorten labels. Remove bureaucracy.\n"
@@ -557,8 +543,8 @@ def fallback_review(chat_id: int, boxes: List[TextBox]) -> Tuple[str, str, str, 
         ),
         ru=(
             "Оценка: 5/10\n"
-            "✅ Плюс: экран живой — но его нужно причесать.\n"
-            "❌ Минусы: неясная иерархия + много конкурирующих сообщений.\n"
+            "✅ Плюс: экран живой.\n"
+            "❌ Минусы: размытая иерархия + много конкурирующих сообщений.\n"
             "Что делать:\n"
             "1) Один главный CTA на экран.\n"
             "2) Сократить формулировки, убрать канцелярит.\n"
@@ -572,7 +558,7 @@ def fallback_review(chat_id: int, boxes: List[TextBox]) -> Tuple[str, str, str, 
         ru=("Вытащенные текстовые блоки:\n" + (snippet or "—")),
     )
 
-    concept = wrap_ascii_lines(fallback_concept_ascii(ASCII_WIDTH), ASCII_WIDTH)
+    concept = clamp_ascii_width(fallback_concept_ascii(ASCII_WIDTH), ASCII_WIDTH)
     return what_i_see, verdict, text_issues, concept
 
 
@@ -615,8 +601,8 @@ async def process_review_from_image(m: Message, img_bytes: bytes) -> None:
         if annotated:
             cap = t(
                 chat_id,
-                "Annotated text blocks (OCR). Numbers match the extracted list.",
-                "Аннотации текстовых блоков (OCR). Номера совпадают со списком.",
+                "Annotated text blocks (OCR).",
+                "Аннотации текстовых блоков (OCR).",
             )
             await m.answer_photo(photo=annotated, caption=cap, reply_markup=None)
         else:
@@ -625,18 +611,18 @@ async def process_review_from_image(m: Message, img_bytes: bytes) -> None:
                 reply_markup=None,
             )
 
-        # Extra short animation before concept
-        title2 = t(chat_id, "Drafting an ASCII concept…", "Собираю ASCII-концепт…")
+        # Short animation before concept
+        title2 = t(chat_id, "Drafting ASCII concept…", "Собираю ASCII-концепт…")
         progress2 = await animate_progress(m, title=title2, chat_id=chat_id)
-        await asyncio.sleep(1.1)
+        await asyncio.sleep(0.9)
         stop_progress(chat_id)
         try:
             await progress2.edit_text(t(chat_id, "Concept ready.", "Концепт готов."), reply_markup=None)
         except Exception:
             pass
 
-        # 4) ASCII concept (monospace)
-        concept = wrap_ascii_lines(concept, ASCII_WIDTH)
+        # 4) ASCII concept (monospace, NO wrapping)
+        concept = clamp_ascii_width(concept, ASCII_WIDTH)
         await m.answer(f"<pre>{h(concept)}</pre>", reply_markup=None, disable_web_page_preview=True)
 
     finally:
@@ -694,7 +680,7 @@ async def on_start(m: Message):
     text = t(
         chat_id,
         "I’m your Design Reviewer partner.\n"
-        "Send me a screenshot OR a public Figma frame link.\n"
+        "Send a screenshot OR a public Figma frame link.\n"
         "I’ll nitpick the UI/UX and the copy (fairly).",
         "Я твой партнёр-дизайн-ревьюер.\n"
         "Кидай скриншот ИЛИ публичную ссылку на фрейм Figma.\n"
@@ -812,7 +798,7 @@ async def main():
         BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    print(f"✅ Bot starting… LLM_ENABLED={LLM_ENABLED}, model={LLM_MODEL}, OCR={TESSERACT_AVAILABLE}")
+    print(f"✅ Bot starting… LLM_ENABLED={LLM_ENABLED}, model={LLM_MODEL}, OCR={TESSERACT_AVAILABLE}, ASCII_WIDTH={ASCII_WIDTH}")
     await dp.start_polling(bot)
 
 
