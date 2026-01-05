@@ -4,7 +4,6 @@
 """
 Design Reviewer Telegram Bot (EN default, RU toggle)
 
-What it does:
 - Accepts screenshots (photos) OR public Figma frame links.
 - Shows retro ASCII progress animation + Cancel button while processing.
 - Replies with 4 outputs:
@@ -16,13 +15,13 @@ What it does:
 Notes:
 - No python-dotenv dependency. Uses environment variables.
 - Uses OpenAI Responses API via stdlib urllib (no openai/httpx/requests dependency required).
-- aiogram v3.x
+- aiogram v3.7+ compatible (DefaultBotProperties)
 
 Required env vars:
 - BOT_TOKEN
 - OPENAI_API_KEY
 
-Optional env vars:
+Optional:
 - LLM_MODEL (default: "gpt-4o-mini")
 - LLM_ENABLED (default: "true")
 """
@@ -33,11 +32,10 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
 from html import escape as html_escape
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, parse_qs, urlencode
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from aiogram import Bot, Dispatcher, F
@@ -51,6 +49,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -65,17 +64,17 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 LLM_ENABLED = os.getenv("LLM_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
 
-# ASCII constraints for Telegram mobile (monospace <pre> tends to wrap after ~40-45 chars)
-ASCII_CONCEPT_COLS = 38  # tuned to avoid wrapping like on your screenshot
+# Telegram mobile safe width for monospace blocks
+ASCII_CONCEPT_COLS = 38
 MAX_ISSUES = 14
 
-# Retro spinner frames (safe, simple, “no weirdness”)
 SPINNER = ["|", "/", "-", "\\"]
-BLOCKS = ["░", "▒", "▓", "█"]  # monochrome-ish blocks
+# (monochrome blocks ok for "black/white" vibe)
+# Using them only inside the animation, not as emojis.
+# ----------------------------
 
-# In-memory per-user state
-USER_LANG: Dict[int, str] = {}          # chat_id -> "en" | "ru"
-RUNNING_TASK: Dict[int, asyncio.Task] = {}  # chat_id -> task
+USER_LANG: Dict[int, str] = {}               # chat_id -> "en" | "ru"
+RUNNING_TASK: Dict[int, asyncio.Task] = {}   # chat_id -> task
 
 
 # ----------------------------
@@ -180,8 +179,7 @@ def main_menu_kb(chat_id: int) -> ReplyKeyboardMarkup:
     channel = TXT[lang]["menu_channel"]
     lang_btn = "🌐 EN" if lang == "en" else "🌐 RU"
 
-    # Reply keyboard cannot open URLs directly; channel button will trigger a message with an inline URL button.
-    kb = ReplyKeyboardMarkup(
+    return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=drop)],
             [KeyboardButton(text=how)],
@@ -191,7 +189,6 @@ def main_menu_kb(chat_id: int) -> ReplyKeyboardMarkup:
         input_field_placeholder=TXT[lang]["need_input"],
         selective=False,
     )
-    return kb
 
 
 def cancel_inline_kb(chat_id: int) -> InlineKeyboardMarkup:
@@ -203,7 +200,6 @@ def cancel_inline_kb(chat_id: int) -> InlineKeyboardMarkup:
 
 
 def channel_inline_kb() -> InlineKeyboardMarkup:
-    # Using telegram deep link
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="@prodooktovy", url="https://t.me/prodooktovy")]
@@ -214,10 +210,6 @@ def channel_inline_kb() -> InlineKeyboardMarkup:
 # ----------------------------
 # Helpers
 # ----------------------------
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
 
 def clamp01(x: float) -> float:
     if x < 0:
@@ -235,7 +227,6 @@ def safe_float(v: Any) -> float:
 
 
 def html_pre(s: str) -> str:
-    # Wrap as <pre> with HTML escaping; keeps monospace.
     return f"<pre>{html_escape(s)}</pre>"
 
 
@@ -278,8 +269,7 @@ def is_probably_figma_link(text: str) -> bool:
 
 
 def extract_figma_url(text: str) -> Optional[str]:
-    # Grab first URL-like token
-    m = re.search(r"(https?://\S+)", text.strip())
+    m = __import__("re").search(r"(https?://\S+)", text.strip())
     if not m:
         return None
     return m.group(1).rstrip(").,]")
@@ -299,7 +289,6 @@ def fetch_url_bytes(url: str, timeout: int = 25) -> bytes:
 
 
 def figma_oembed(url: str) -> Optional[Dict[str, Any]]:
-    # Public oEmbed works for public files
     api = "https://www.figma.com/api/oembed?" + urlencode({"url": url})
     try:
         raw = fetch_url_bytes(api, timeout=25)
@@ -323,29 +312,18 @@ def download_figma_preview(url: str) -> Optional[bytes]:
 
 def image_bytes_to_data_url(img_bytes: bytes) -> str:
     b64 = base64.b64encode(img_bytes).decode("utf-8")
-    # assume PNG/JPEG; data URL doesn't strictly require exact mime for the API to work
     return "data:image/png;base64," + b64
 
 
 def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
     raw = raw.strip()
-
-    # If model returned something like {'key': ...} with single quotes -> try to fix
-    # Also attempt to extract the first JSON object inside the text.
-    candidates: List[str] = []
-
-    # 1) direct
-    candidates.append(raw)
-
-    # 2) extract {...} block
+    candidates: List[str] = [raw]
     m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     if m:
         candidates.append(m.group(0))
 
-    # 3) replace smart quotes / single quotes (best-effort)
     def normalize_quotes(s: str) -> str:
         s = s.replace("“", '"').replace("”", '"').replace("’", "'")
-        # If looks like python dict: replace single quotes with double quotes (risky but helps)
         if "'" in s and '"' not in s:
             s = s.replace("'", '"')
         return s
@@ -367,13 +345,7 @@ def parse_llm_json(raw: str) -> Optional[Dict[str, Any]]:
 
 def openai_responses_create(model: str, input_payload: List[Dict[str, Any]], timeout: int = 60) -> Dict[str, Any]:
     url = "https://api.openai.com/v1/responses"
-    body = json.dumps(
-        {
-            "model": model,
-            "input": input_payload,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
+    body = json.dumps({"model": model, "input": input_payload}, ensure_ascii=False).encode("utf-8")
 
     req = Request(
         url,
@@ -390,7 +362,6 @@ def openai_responses_create(model: str, input_payload: List[Dict[str, Any]], tim
 
 
 def extract_output_text(resp: Dict[str, Any]) -> str:
-    # Responses API returns resp["output"] list with message items, content items
     out_parts: List[str] = []
     for item in resp.get("output", []) or []:
         if item.get("type") == "message":
@@ -412,8 +383,7 @@ def llm_review_once(image_data_url: str, lang: str, repair_hint: str = "") -> Di
     system = (
         "You are a strict senior product designer doing a partner-style design review. "
         "Be direct and critical but not rude; no profanity. "
-        "Use only black/white emoji when needed (keep it minimal). "
-        "If something is good, explicitly praise what is good and why. "
+        "Use only minimal black/white emoji if needed. "
         "Only GUESS font family vibes and palette vibes; do NOT mention exact sizes, pixels, hex codes. "
         "Return ONLY valid JSON (no markdown, no code fences, no extra text)."
     )
@@ -477,7 +447,6 @@ def llm_review_once(image_data_url: str, lang: str, repair_hint: str = "") -> Di
     if not isinstance(data, dict):
         raise ValueError("INVALID_JSON")
 
-    # normalize
     try:
         score = int(data.get("score", 0))
     except Exception:
@@ -517,11 +486,9 @@ def llm_review_once(image_data_url: str, lang: str, repair_hint: str = "") -> Di
 
 
 def llm_review(image_data_url: str, lang: str) -> Dict[str, Any]:
-    # attempt 1
     try:
         return llm_review_once(image_data_url, lang)
     except Exception:
-        # attempt 2 (force JSON-only)
         repair_hint = (
             "Return JSON only. No extra text. No markdown. "
             "Keep only required keys. Escape quotes properly."
@@ -534,7 +501,6 @@ def llm_review(image_data_url: str, lang: str) -> Dict[str, Any]:
 # ----------------------------
 
 def load_font(size: int) -> ImageFont.FreeTypeFont:
-    # Portable fallback: try DejaVuSans, else PIL default.
     try:
         return ImageFont.truetype("DejaVuSans.ttf", size=size)
     except Exception:
@@ -545,30 +511,24 @@ def annotate_image(img_bytes: bytes, issues: List[Dict[str, Any]]) -> bytes:
     img = Image.open(BytesIO(img_bytes)).convert("RGB")
     w, h = img.size
     draw = ImageDraw.Draw(img)
-
     font = load_font(18)
 
-    # Draw boxes
     for idx, it in enumerate(issues, start=1):
         x = int(clamp01(it["x"]) * w)
         y = int(clamp01(it["y"]) * h)
         bw = int(clamp01(it["w"]) * w)
         bh = int(clamp01(it["h"]) * h)
-
-        # guard: if model returned nonsense, skip
         if bw < 8 or bh < 8:
             continue
-
         x2 = min(w - 1, x + bw)
         y2 = min(h - 1, y + bh)
 
-        # monochrome “review” look: white outline + black shadow
         for off in (0, 1):
             draw.rectangle([x - off, y - off, x2 + off, y2 + off], outline=(255, 255, 255))
 
-        # label
         label = str(idx)
-        tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         pad_px = 6
         box = [x, max(0, y - th - 2 * pad_px), x + tw + 2 * pad_px, y]
         draw.rectangle(box, fill=(0, 0, 0))
@@ -584,10 +544,6 @@ def annotate_image(img_bytes: bytes, issues: List[Dict[str, Any]]) -> bytes:
 # ----------------------------
 
 def hard_wrap_lines(text: str, width: int) -> str:
-    """
-    Wrap preserving words where possible, but also break long tokens.
-    Ensures no line exceeds `width`.
-    """
     lines_in = (text or "").splitlines() or [""]
     out_lines: List[str] = []
 
@@ -597,16 +553,13 @@ def hard_wrap_lines(text: str, width: int) -> str:
             out_lines.append("")
             continue
 
-        # If the line is already within width, keep
         if len(s) <= width:
             out_lines.append(s)
             continue
 
-        # Word wrap with forced breaks for long tokens
         cur = ""
         for token in re.split(r"(\s+)", s):
             if token.strip() == "":
-                # whitespace
                 if len(cur) + len(token) <= width:
                     cur += token
                 else:
@@ -614,9 +567,7 @@ def hard_wrap_lines(text: str, width: int) -> str:
                     cur = ""
                 continue
 
-            # token word
             while len(token) > width:
-                # flush current
                 if cur.strip():
                     out_lines.append(cur.rstrip())
                     cur = ""
@@ -629,10 +580,8 @@ def hard_wrap_lines(text: str, width: int) -> str:
                 out_lines.append(cur.rstrip())
                 cur = token
 
-        if cur.strip() or cur == "":
-            out_lines.append(cur.rstrip())
+        out_lines.append(cur.rstrip())
 
-    # final guard: trim each line
     out_lines = [ln[:width] for ln in out_lines]
     return "\n".join(out_lines).rstrip()
 
@@ -655,10 +604,6 @@ def ascii_box(title: str, body: str, width: int) -> str:
 # ----------------------------
 
 async def animate_progress(anchor: Message, chat_id: int, title: str, seconds: float = 2.0) -> Optional[Message]:
-    """
-    Sends a message and edits it with retro frames for `seconds`.
-    If editing fails, falls back to sending new frames less often.
-    """
     msg: Optional[Message] = None
     start = time.time()
     step = 0
@@ -669,7 +614,6 @@ async def animate_progress(anchor: Message, chat_id: int, title: str, seconds: f
         msg = None
 
     while time.time() - start < seconds:
-        # cancel support
         task = RUNNING_TASK.get(chat_id)
         if task and task.cancelled():
             break
@@ -680,10 +624,8 @@ async def animate_progress(anchor: Message, chat_id: int, title: str, seconds: f
             try:
                 await msg.edit_text(frame, reply_markup=cancel_inline_kb(chat_id))
             except Exception:
-                # Telegram sometimes says "message can't be edited"
                 msg = None
         else:
-            # fallback: do not spam; send only occasionally
             if step % 4 == 0:
                 try:
                     msg = await anchor.answer(frame, reply_markup=cancel_inline_kb(chat_id))
@@ -697,7 +639,7 @@ async def animate_progress(anchor: Message, chat_id: int, title: str, seconds: f
 
 
 # ----------------------------
-# Review message composition
+# Review text composition
 # ----------------------------
 
 def build_verdict_text(chat_id: int, review: Dict[str, Any]) -> str:
@@ -711,8 +653,6 @@ def build_verdict_text(chat_id: int, review: Dict[str, Any]) -> str:
         title = (it.get("title") or "").strip()
         problem = (it.get("problem") or "").strip()
         fix = (it.get("fix") or "").strip()
-
-        # Keep it crisp (no tech details)
         row = f"{i}. [{kind}] {title}\n   What’s wrong: {problem}\n   Do this: {fix}"
         issues_lines.append(row)
 
@@ -728,12 +668,23 @@ def build_verdict_text(chat_id: int, review: Dict[str, Any]) -> str:
 
 
 # ----------------------------
-# Handlers
+# Bot init (aiogram 3.7+ fix)
 # ----------------------------
 
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+if not BOT_TOKEN:
+    # Let it fail early with a clear message in logs
+    raise RuntimeError("Set BOT_TOKEN in environment")
+
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
+
+# ----------------------------
+# Handlers
+# ----------------------------
 
 @dp.callback_query(F.data == "cancel")
 async def on_cancel(cb: CallbackQuery):
@@ -745,7 +696,6 @@ async def on_cancel(cb: CallbackQuery):
         await cb.answer("OK")
     except Exception:
         pass
-    # keep menu only at start and end of review, but cancel is an end-of-review event
     if cb.message:
         await cb.message.answer(t(chat_id, "cancelled"), reply_markup=main_menu_kb(chat_id))
 
@@ -754,14 +704,14 @@ async def on_cancel(cb: CallbackQuery):
 async def start(m: Message):
     chat_id = m.chat.id
     USER_LANG.setdefault(chat_id, "en")
-    title = t(chat_id, "welcome_title")
-    body = t(chat_id, "welcome_body")
-    await m.answer(f"<b>{html_escape(title)}</b>\n\n{html_escape(body)}", reply_markup=main_menu_kb(chat_id))
+    await m.answer(
+        f"<b>{html_escape(t(chat_id, 'welcome_title'))}</b>\n\n{html_escape(t(chat_id, 'welcome_body'))}",
+        reply_markup=main_menu_kb(chat_id),
+    )
 
 
 @dp.message(Command("ping"))
 async def ping(m: Message):
-    # Kept for compatibility; menu now has channel button instead.
     await m.answer("pong", reply_markup=main_menu_kb(m.chat.id))
 
 
@@ -770,13 +720,11 @@ async def on_text(m: Message):
     chat_id = m.chat.id
     text = (m.text or "").strip()
 
-    # Language toggle button text
     if text in ("🌐 EN", "🌐 RU"):
         USER_LANG[chat_id] = "ru" if text == "🌐 RU" else "en"
         await m.answer("OK", reply_markup=main_menu_kb(chat_id))
         return
 
-    # Menu buttons
     if text == TXT[lang_of(chat_id)]["menu_how"]:
         await m.answer(html_escape(t(chat_id, "how")), reply_markup=main_menu_kb(chat_id))
         return
@@ -790,7 +738,6 @@ async def on_text(m: Message):
         await m.answer(html_escape(t(chat_id, "need_input")), reply_markup=main_menu_kb(chat_id))
         return
 
-    # Figma link?
     if is_probably_figma_link(text):
         url = extract_figma_url(text)
         if not url:
@@ -799,7 +746,6 @@ async def on_text(m: Message):
         await handle_review_input(m, figma_url=url)
         return
 
-    # Otherwise: gentle nudge
     await m.answer(html_escape(t(chat_id, "need_input")), reply_markup=main_menu_kb(chat_id))
 
 
@@ -814,8 +760,6 @@ async def on_photo(m: Message):
 
 async def handle_review_input(m: Message, photo_message: Optional[Message] = None, figma_url: Optional[str] = None):
     chat_id = m.chat.id
-
-    # Prevent parallel reviews per chat
     existing = RUNNING_TASK.get(chat_id)
     if existing and not existing.done():
         await m.answer(html_escape(t(chat_id, "busy")), reply_markup=main_menu_kb(chat_id))
@@ -826,10 +770,8 @@ async def handle_review_input(m: Message, photo_message: Optional[Message] = Non
     try:
         await task
     except asyncio.CancelledError:
-        # already handled by cancel callback
         pass
     finally:
-        # cleanup task
         if RUNNING_TASK.get(chat_id) is task:
             RUNNING_TASK.pop(chat_id, None)
 
@@ -838,21 +780,14 @@ async def _review_task(anchor: Message, photo_message: Optional[Message], figma_
     chat_id = anchor.chat.id
     lang = lang_of(chat_id)
 
-    if not BOT_TOKEN:
-        await anchor.answer("BOT_TOKEN is not set.")
-        return
-
     if not LLM_ENABLED:
         await anchor.answer(html_escape(t(chat_id, "llm_off")), reply_markup=main_menu_kb(chat_id))
         return
-
     if not OPENAI_API_KEY:
         await anchor.answer("OPENAI_API_KEY is not set.", reply_markup=main_menu_kb(chat_id))
         return
 
-    # 1) Get image bytes
     img_bytes: Optional[bytes] = None
-
     await anchor.answer(html_escape(t(chat_id, "accepted")), reply_markup=None)
 
     if figma_url:
@@ -861,36 +796,25 @@ async def _review_task(anchor: Message, photo_message: Optional[Message], figma_
         if not img_bytes:
             await anchor.answer(html_escape(t(chat_id, "figma_failed")), reply_markup=main_menu_kb(chat_id))
             return
-        # Show the downloaded preview (so user sees what exactly got reviewed)
         try:
             await anchor.answer_photo(img_bytes, caption="Figma preview")
         except Exception:
             pass
 
     elif photo_message:
-        # Download telegram photo
         try:
             file = await bot.get_file(photo_message.photo[-1].file_id)
-            img_bytes = await bot.download_file(file.file_path)
-            if hasattr(img_bytes, "read"):
-                img_bytes = img_bytes.read()
+            downloaded = await bot.download_file(file.file_path)
+            img_bytes = downloaded.read() if hasattr(downloaded, "read") else downloaded
         except Exception:
             await anchor.answer("Failed to download image.", reply_markup=main_menu_kb(chat_id))
             return
-
     else:
         await anchor.answer(html_escape(t(chat_id, "need_input")), reply_markup=main_menu_kb(chat_id))
         return
 
-    # Cancel check
-    task = RUNNING_TASK.get(chat_id)
-    if task and task.cancelled():
-        return
-
-    # 2) Retro progress animation: analysis
     await animate_progress(anchor, chat_id, title=t(chat_id, "processing"), seconds=2.5)
 
-    # 3) LLM review
     image_data_url = image_bytes_to_data_url(img_bytes)
     try:
         review = await asyncio.to_thread(llm_review, image_data_url, lang)
@@ -900,39 +824,31 @@ async def _review_task(anchor: Message, photo_message: Optional[Message], figma_
         await anchor.answer(html_escape(t(chat_id, "llm_bad")), reply_markup=main_menu_kb(chat_id))
         return
 
-    # 4) Message #1: what I see
     what = (review.get("what_i_see") or "").strip()
     if not what:
         what = "(No description.)" if lang == "en" else "(Нет описания.)"
-    msg1 = f"<b>{html_escape(t(chat_id, 'what_i_see'))}:</b>\n{html_escape(what)}"
-    await anchor.answer(msg1, reply_markup=None)
+    await anchor.answer(
+        f"<b>{html_escape(t(chat_id, 'what_i_see'))}:</b>\n{html_escape(what)}",
+        reply_markup=None,
+    )
 
-    # 5) Message #2: verdict + recommendations + score + issues list
-    msg2 = build_verdict_text(chat_id, review)
-    await anchor.answer(msg2, reply_markup=None)
+    await anchor.answer(build_verdict_text(chat_id, review), reply_markup=None)
 
-    # 6) Message #3: annotated image
-    issues = review.get("issues") or []
     try:
-        annotated = await asyncio.to_thread(annotate_image, img_bytes, issues)
+        annotated = await asyncio.to_thread(annotate_image, img_bytes, review.get("issues") or [])
         await anchor.answer_photo(annotated, caption="Annotations")
     except Exception:
-        # If annotation fails, don’t crash the review
         pass
 
-    # 7) Progress animation before ASCII concept (shorter)
     await animate_progress(anchor, chat_id, title=t(chat_id, "thinking"), seconds=1.6)
 
-    # 8) Message #4: ASCII concept (monospace, no wrapping)
     concept = (review.get("ascii_concept") or "").strip()
     if not concept:
         concept = "ASCII concept not provided." if lang == "en" else "ASCII-концепт не получился."
     concept = hard_wrap_lines(concept, ASCII_CONCEPT_COLS)
-
     boxed = ascii_box(t(chat_id, "ascii_concept"), concept, width=ASCII_CONCEPT_COLS + 4)
     await anchor.answer(html_pre(boxed), reply_markup=None)
 
-    # 9) End-of-review: show menu again (ONLY here)
     await anchor.answer(html_escape(t(chat_id, "done")), reply_markup=main_menu_kb(chat_id))
 
 
@@ -941,8 +857,6 @@ async def _review_task(anchor: Message, photo_message: Optional[Message], figma_
 # ----------------------------
 
 async def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN in environment")
     print(f"✅ Bot starting... LLM_ENABLED={LLM_ENABLED}, model={LLM_MODEL}")
     await dp.start_polling(bot)
 
