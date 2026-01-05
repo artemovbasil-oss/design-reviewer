@@ -619,7 +619,11 @@ async def process_review_from_image(m: Message, img_bytes: bytes) -> None:
                 "Annotated text blocks (OCR).",
                 "Аннотации текстовых блоков (OCR).",
             )
-            await m.answer_photo(photo=annotated, caption=cap, reply_markup=None)
+            from aiogram.types import BufferedInputFile
+
+            # annotated = bytes PNG
+            photo = BufferedInputFile(annotated, filename="review.png")
+            await m.answer_photo(photo=photo, caption=cap, reply_markup=None)
         else:
             await m.answer(
                 t(chat_id, "No readable text blocks detected for annotation.", "Не нашёл читаемых текстовых блоков для аннотаций."),
