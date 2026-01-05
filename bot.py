@@ -6,7 +6,7 @@
 #   1) What I see
 #   2) Verdict + recommendations (UX + text) + score /10
 #   3) Annotated screenshot
-#   4) Concept: always ASCII wireframe (retro). No "service unavailable" whining.
+#   4) Concept: always ASCII wireframe (retro).
 #
 # Env vars:
 #   BOT_TOKEN (required)
@@ -22,7 +22,6 @@ import io
 import json
 import os
 import re
-import time
 import urllib.parse
 import urllib.request
 import html as py_html
@@ -63,6 +62,7 @@ PROGRESS_DELAY = float(os.getenv("PROGRESS_DELAY") or "0.12")
 PROGRESS_STEPS = int(os.getenv("PROGRESS_STEPS") or "22")
 
 CHANNEL_URL = "https://t.me/prodooktovy"
+MAX_PREVIEW_BYTES = int(os.getenv("MAX_PREVIEW_BYTES") or "8000000")
 
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in environment variables (Railway Variables or local env).")
@@ -101,7 +101,7 @@ HOW_TEXT = (
 
 REVIEW_HINT = (
     "Кидай сюда скриншот или ссылку на публичный Figma-фрейм.\n"
-    "Я разберу и докопаюсь по делу 🙂 (без мата)."
+    "Докопаюсь по делу (без мата) и дам конкретные улучшения."
 )
 
 
@@ -148,17 +148,11 @@ def resize_long_side(img: Image.Image, max_side: int) -> Image.Image:
     nh = max(1, int(h * scale))
     return img.resize((nw, nh), Image.LANCZOS)
 
-def image_to_b64_png(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
 def bytes_to_b64_data_url_png(img_bytes: bytes) -> str:
     b64 = base64.b64encode(img_bytes).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
 async def safe_edit(msg: Message, text: str) -> Message:
-    # Telegram sometimes forbids editing (e.g., message too old, race condition)
     try:
         await msg.edit_text(text, parse_mode=ParseMode.HTML)
         return msg
@@ -173,12 +167,10 @@ def looks_like_figma_url(s: str) -> bool:
     return "figma.com" in s and ("node-id=" in s or "/design/" in s or "/file/" in s)
 
 def normalize_figma_url(url: str) -> str:
-    url = (url or "").strip()
-    url = url.replace(" ", "")
+    url = (url or "").strip().replace(" ", "")
     return url
 
 def figma_oembed(url: str) -> Optional[Dict[str, Any]]:
-    # No caching: always hit oEmbed for each link
     try:
         api = "https://www.figma.com/api/oembed?url=" + urllib.parse.quote(url, safe="")
         req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
@@ -206,7 +198,6 @@ def download_url_bytes(url: str, max_bytes: int = 8_000_000) -> Optional[bytes]:
 SPIN = ["|", "/", "-", "\\"]
 
 def progress_line(step: int, total: int) -> str:
-    # compact: 1 line, retro
     p = 0.0 if total <= 0 else step / float(total)
     bar_w = 16
     fill = int(p * bar_w)
@@ -215,12 +206,17 @@ def progress_line(step: int, total: int) -> str:
     pct = int(p * 100)
     return f"{spin} {bar} {pct:>3d}%"
 
-async def animate_progress(anchor: Message, title: str = "Review") -> Message:
-    # One message, edited in-place; if edit fails -> fallback to send new.
-    msg = await anchor.answer(f"<code>{html_escape(title)}\n{html_escape(progress_line(0, PROGRESS_STEPS))}</code>", parse_mode=ParseMode.HTML)
+async def animate_progress(anchor: Message, title: str = "REVIEW") -> Message:
+    msg = await anchor.answer(
+        f"<code>{html_escape(title)}\n{html_escape(progress_line(0, PROGRESS_STEPS))}</code>",
+        parse_mode=ParseMode.HTML,
+    )
     for i in range(1, PROGRESS_STEPS + 1):
         await asyncio.sleep(PROGRESS_DELAY)
-        msg = await safe_edit(msg, f"<code>{html_escape(title)}\n{html_escape(progress_line(i, PROGRESS_STEPS))}</code>")
+        msg = await safe_edit(
+            msg,
+            f"<code>{html_escape(title)}\n{html_escape(progress_line(i, PROGRESS_STEPS))}</code>",
+        )
     return msg
 
 
@@ -228,12 +224,10 @@ async def animate_progress(anchor: Message, title: str = "Review") -> Message:
 # OCR extraction
 # =========================
 def extract_ocr_blocks(img: Image.Image) -> List[Dict[str, Any]]:
-    # Use image_to_data for boxes
     data = pytesseract.image_to_data(img, lang=OCR_LANG, output_type=pytesseract.Output.DICT)
     n = len(data.get("text", []))
     blocks: List[Dict[str, Any]] = []
 
-    # Group words into lines by (block_num, par_num, line_num)
     groups: Dict[Tuple[int, int, int], List[int]] = {}
     for i in range(n):
         txt = (data["text"][i] or "").strip()
@@ -242,15 +236,12 @@ def extract_ocr_blocks(img: Image.Image) -> List[Dict[str, Any]]:
             conf = int(float(conf_raw))
         except Exception:
             conf = 0
-        if not txt:
-            continue
-        if conf < OCR_CONF_MIN:
+        if not txt or conf < OCR_CONF_MIN:
             continue
         key = (int(data["block_num"][i]), int(data["par_num"][i]), int(data["line_num"][i]))
         groups.setdefault(key, []).append(i)
 
-    for key, idxs in groups.items():
-        # bbox union
+    for idxs in groups.values():
         xs, ys, xe, ye = [], [], [], []
         words = []
         confs = []
@@ -263,6 +254,7 @@ def extract_ocr_blocks(img: Image.Image) -> List[Dict[str, Any]]:
                 confs.append(int(float(data.get("conf", ["0"])[i])))
             except Exception:
                 confs.append(0)
+
         text = " ".join(words).strip()
         if not text:
             continue
@@ -274,16 +266,14 @@ def extract_ocr_blocks(img: Image.Image) -> List[Dict[str, Any]]:
             "conf": int(sum(confs) / max(1, len(confs))),
         })
 
-    # Sort top-to-bottom
     blocks.sort(key=lambda b: (b["bbox"][1], b["bbox"][0]))
-    # reassign ids
     for i, b in enumerate(blocks):
         b["id"] = i
     return blocks
 
 
 # =========================
-# LLM: one call, strict JSON
+# LLM review (FIXED content types)
 # =========================
 SCHEMA = {
     "name": "design_review_result",
@@ -293,10 +283,7 @@ SCHEMA = {
         "properties": {
             "what_i_see": {"type": "string"},
             "score_10": {"type": "integer", "minimum": 0, "maximum": 10},
-            "praise": {
-                "type": "array",
-                "items": {"type": "string"},
-            },
+            "praise": {"type": "array", "items": {"type": "string"}},
             "issues": {
                 "type": "array",
                 "items": {
@@ -321,15 +308,14 @@ SCHEMA = {
 
 SYSTEM_PROMPT = (
     "Ты — жесткий, но адекватный старший дизайн-товарищ (без мата). "
-    "Твоя цель — докопаться по делу и помочь улучшить UI и тексты. "
-    "Не разводи воду. Если что-то ок — хвали конкретно. Если плохо — говори прямо. "
-    "Про шрифты и палитру: только угадывай семейство/стиль (без размеров, без точных цветов). "
+    "Цель — докопаться по делу и помочь улучшить UI и тексты. "
+    "Если ок — хвали конкретно. Если плохо — говори прямо и предлагай фиксы. "
+    "Про шрифты и палитру: только угадывай семейство/стиль (без размеров и точных цветов). "
     "Контекст элементов (заголовок/кнопка/поле/подсказка) определяй аккуратно. "
     "Отдавай результат строго JSON по схеме."
 )
 
 def build_user_prompt(ocr_blocks: List[Dict[str, Any]], img_w: int, img_h: int) -> str:
-    # Keep it short: send blocks list for referencing
     lines = []
     lines.append(f"Размер изображения: {img_w}x{img_h}.")
     lines.append("OCR-блоки (id, bbox[x1,y1,x2,y2], text):")
@@ -339,33 +325,52 @@ def build_user_prompt(ocr_blocks: List[Dict[str, Any]], img_w: int, img_h: int) 
         lines.append(f"...и ещё {len(ocr_blocks)-120} блоков")
     lines.append(
         "Нужно:\n"
-        "1) what_i_see: кратко, человечески, без JSON-оберток.\n"
-        "2) score_10: честная оценка 0-10.\n"
+        "1) what_i_see: человечески, кратко.\n"
+        "2) score_10: честно 0-10.\n"
         "3) praise: 0-5 пунктов.\n"
-        "4) issues: список проблем (UX и Текст), с severity 1-5, и конкретным фиксом.\n"
+        "4) issues: UX+Text, severity 1-5, что не так и что сделать.\n"
         "   block_ids — привяжи к OCR-блокам, если возможно.\n"
-        "5) ascii_concept: сделай ретро-вайрфрейм (ASCII), как могло бы быть лучше.\n"
+        "5) ascii_concept: ретро-вайрфрейм ASCII, как сделать лучше.\n"
     )
     return "\n".join(lines)
+
+def extract_json_text_from_response(resp: Any) -> str:
+    # Prefer output_text if present, otherwise traverse resp.output
+    raw = getattr(resp, "output_text", None)
+    if raw:
+        return raw
+    chunks = []
+    try:
+        for o in getattr(resp, "output", []) or []:
+            for c in getattr(o, "content", []) or []:
+                # output_text and summary_text are supported output types
+                if getattr(c, "type", "") in ("output_text", "summary_text"):
+                    t = getattr(c, "text", "") or ""
+                    if t:
+                        chunks.append(t)
+    except Exception:
+        pass
+    return "\n".join(chunks).strip()
 
 def call_llm_review(img_bytes: bytes, ocr_blocks: List[Dict[str, Any]]) -> Dict[str, Any]:
     img = pil_open_image(img_bytes)
     w, h = img.size
     user_prompt = build_user_prompt(ocr_blocks, w, h)
 
-    # Vision image (downscale for speed)
     vimg = resize_long_side(img, MAX_VISION_SIDE)
     vbuf = io.BytesIO()
     vimg.save(vbuf, format="PNG", optimize=True)
-    vbytes = vbuf.getvalue()
-    data_url = bytes_to_b64_data_url_png(vbytes)
+    data_url = bytes_to_b64_data_url_png(vbuf.getvalue())
 
+    # IMPORTANT FIX:
+    # - content item types must be input_text / input_image
+    # - in system role content uses input_text
     resp = client.responses.create(
         model=LLM_MODEL,
         input=[
             {
                 "role": "system",
-                "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
             },
             {
                 "role": "user",
@@ -385,21 +390,9 @@ def call_llm_review(img_bytes: bytes, ocr_blocks: List[Dict[str, Any]]) -> Dict[
         },
     )
 
-    # openai python: resp.output_text contains text; for json schema it will be json string
-    raw = getattr(resp, "output_text", None)
-    if not raw:
-        # fallback: try to dig in outputs
-        raw = ""
-        try:
-            for o in resp.output:
-                for c in o.content:
-                    if c.type in ("output_text", "text"):
-                        raw += c.text
-        except Exception:
-            pass
+    raw = extract_json_text_from_response(resp)
     if not raw:
         raise RuntimeError("LLM returned empty response")
-
     return json.loads(raw)
 
 
@@ -407,21 +400,20 @@ def call_llm_review(img_bytes: bytes, ocr_blocks: List[Dict[str, Any]]) -> Dict[
 # Rendering output (HTML-safe)
 # =========================
 def format_verdict(result: Dict[str, Any]) -> str:
-    score = result.get("score_10", 0)
+    score = int(result.get("score_10", 0) or 0)
     praise = result.get("praise", []) or []
     issues = result.get("issues", []) or []
 
-    # Black/white emoji only: use simple bullets and symbols
-    # No colored emojis.
     parts = []
-    parts.append(f"<b>Оценка:</b> {int(score)}/10")
+    parts.append(f"<b>Оценка:</b> {score}/10")
+
     if praise:
         parts.append("\n<b>Что хорошо:</b>")
         for p in praise[:6]:
             parts.append(f"• {html_escape(str(p))}")
+
     if issues:
         parts.append("\n<b>Что не ок и как исправить:</b>")
-        # sort: severity desc, then area
         issues_sorted = sorted(issues, key=lambda x: (-int(x.get("severity", 1)), str(x.get("area", ""))))
         for it in issues_sorted[:14]:
             area = str(it.get("area", "ux")).upper()
@@ -429,9 +421,13 @@ def format_verdict(result: Dict[str, Any]) -> str:
             title = html_escape(str(it.get("title", "")).strip())
             wrong = html_escape(str(it.get("what_is_wrong", "")).strip())
             fix = html_escape(str(it.get("how_to_fix", "")).strip())
-            parts.append(f"\n<b>[{area}]</b> (жёсткость {sev}/5) — <b>{title}</b>\n{wrong}\n<b>Сделай так:</b> {fix}")
+            parts.append(
+                f"\n<b>[{area}]</b> (жёсткость {sev}/5) — <b>{title}</b>\n"
+                f"{wrong}\n"
+                f"<b>Сделай так:</b> {fix}"
+            )
     else:
-        parts.append("\n<b>Замечаний нет.</b> Подозрительно, но ладно 🙂")
+        parts.append("\n<b>Замечаний нет.</b> Подозрительно, но ладно.")
 
     return "\n".join(parts).strip()
 
@@ -442,17 +438,15 @@ def format_what_i_see(result: Dict[str, Any]) -> str:
 def format_ascii_concept(result: Dict[str, Any]) -> str:
     concept = str(result.get("ascii_concept", "")).rstrip()
     if not concept:
-        # always provide a minimal concept instead of whining
         concept = (
             "+----------------------+\n"
-            "|  HEADER              |\n"
-            "|  Subheader text      |\n"
+            "| HEADER               |\n"
+            "| Subheader            |\n"
             "|                      |\n"
-            "|  [ Primary Action ]  |\n"
-            "|  Secondary action    |\n"
+            "| [ Primary action ]   |\n"
+            "| Secondary action     |\n"
             "+----------------------+\n"
         )
-    # limit length to avoid telegram overflow
     concept = concept[:3000]
     return f"<code>{html_escape(concept)}</code>"
 
@@ -464,8 +458,6 @@ def draw_annotations(img_bytes: bytes, ocr_blocks: List[Dict[str, Any]], issues:
     img = pil_open_image(img_bytes)
     draw = ImageDraw.Draw(img)
 
-    # Use only b/w: black rectangles + white label background (simple)
-    # Collect block ids to highlight with index numbers (1..N)
     seen: Dict[int, int] = {}
     label = 1
     for it in issues[:20]:
@@ -474,7 +466,6 @@ def draw_annotations(img_bytes: bytes, ocr_blocks: List[Dict[str, Any]], issues:
                 seen[bid] = label
                 label += 1
 
-    # Try a default font; if fails, use PIL default.
     try:
         font = ImageFont.load_default()
     except Exception:
@@ -482,19 +473,21 @@ def draw_annotations(img_bytes: bytes, ocr_blocks: List[Dict[str, Any]], issues:
 
     for bid, num in seen.items():
         x1, y1, x2, y2 = ocr_blocks[bid]["bbox"]
-        # Expand a bit
         pad = 3
         x1 = clamp(x1 - pad, 0, img.size[0] - 1)
         y1 = clamp(y1 - pad, 0, img.size[1] - 1)
         x2 = clamp(x2 + pad, 0, img.size[0] - 1)
         y2 = clamp(y2 + pad, 0, img.size[1] - 1)
 
-        # rectangle
         draw.rectangle([x1, y1, x2, y2], outline=(0, 0, 0), width=3)
 
-        # label box
         tag = str(num)
-        tw, th = draw.textbbox((0, 0), tag, font=font)[2:]
+        try:
+            bbox = draw.textbbox((0, 0), tag, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            tw, th = (8, 10)
+
         bx1, by1 = x1, max(0, y1 - th - 6)
         bx2, by2 = x1 + tw + 10, y1
         draw.rectangle([bx1, by1, bx2, by2], fill=(0, 0, 0))
@@ -509,31 +502,25 @@ def draw_annotations(img_bytes: bytes, ocr_blocks: List[Dict[str, Any]], issues:
 # Processing: image / figma link
 # =========================
 async def process_and_reply(anchor: Message, img_bytes: bytes, source_title: str = "Screenshot") -> None:
-    # Progress animation
     await animate_progress(anchor, title="REVIEW")
 
-    # OCR
     img = pil_open_image(img_bytes)
     ocr_blocks = extract_ocr_blocks(img)
 
-    # LLM Review
     result = call_llm_review(img_bytes, ocr_blocks)
 
-    # Message 1: what I see
     await anchor.answer(
         f"<b>Что вижу:</b>\n{format_what_i_see(result)}",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu(),
     )
 
-    # Message 2: verdict (ux+text together)
     await anchor.answer(
         format_verdict(result),
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu(),
     )
 
-    # Message 3: annotated screenshot (if we have blocks/issues)
     issues = result.get("issues", []) or []
     annotated_bytes = draw_annotations(img_bytes, ocr_blocks, issues)
     await anchor.answer_photo(
@@ -542,10 +529,8 @@ async def process_and_reply(anchor: Message, img_bytes: bytes, source_title: str
         reply_markup=main_menu(),
     )
 
-    # Small progress between 3 and 4 (compact)
     await animate_progress(anchor, title="CONCEPT")
 
-    # Message 4: concept (always ASCII; no failure text)
     await anchor.answer(
         f"<b>Концепт (ASCII):</b>\n{format_ascii_concept(result)}",
         parse_mode=ParseMode.HTML,
@@ -568,7 +553,7 @@ async def process_figma_link(anchor: Message, url: str) -> None:
 
     if not thumb:
         await anchor.answer(
-            "Я вижу ссылку, но превью фигмы не отдало картинку. Проверь публичность файла.",
+            "Я вижу ссылку, но Figma не отдала превью-картинку. Проверь публичность файла.",
             reply_markup=main_menu(),
         )
         return
@@ -576,12 +561,11 @@ async def process_figma_link(anchor: Message, url: str) -> None:
     img_bytes = download_url_bytes(thumb, max_bytes=MAX_PREVIEW_BYTES)
     if not img_bytes:
         await anchor.answer(
-            "Не смог скачать превью (слишком большое или недоступно). Попробуй другую ссылку/крупнее.",
+            "Не смог скачать превью (слишком большое или недоступно). Попробуй другую ссылку.",
             reply_markup=main_menu(),
         )
         return
 
-    # Show preview first
     try:
         await anchor.answer_photo(
             BufferedInputFile(img_bytes, filename="figma_preview.png"),
@@ -589,7 +573,6 @@ async def process_figma_link(anchor: Message, url: str) -> None:
             reply_markup=main_menu(),
         )
     except Exception:
-        # ok, continue anyway
         pass
 
     await process_and_reply(anchor, img_bytes, source_title=title)
@@ -626,7 +609,11 @@ async def on_photo(m: Message) -> None:
         img_bytes = buf.getvalue()
         await process_and_reply(m, img_bytes, source_title="Screenshot")
     except Exception as e:
-        await m.answer(f"Сломался на картинке: {html_escape(str(e))}", reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        await m.answer(
+            f"Сломался на картинке: {html_escape(str(e))}",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML,
+        )
 
 @router.message(F.document)
 async def on_document(m: Message) -> None:
@@ -643,7 +630,11 @@ async def on_document(m: Message) -> None:
         img_bytes = buf.getvalue()
         await process_and_reply(m, img_bytes, source_title="Screenshot")
     except Exception as e:
-        await m.answer(f"Сломался на файле: {html_escape(str(e))}", reply_markup=main_menu(), parse_mode=ParseMode.HTML)
+        await m.answer(
+            f"Сломался на файле: {html_escape(str(e))}",
+            reply_markup=main_menu(),
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # =========================
@@ -658,13 +649,11 @@ async def on_text(m: Message) -> None:
         await m.answer(WELCOME_TEXT, reply_markup=main_menu())
         return
 
-    # Find figma link in message
     match = FIGMA_URL_RE.search(txt)
     if match and looks_like_figma_url(match.group(1)):
         await process_figma_link(m, match.group(1))
         return
 
-    # fallback
     await m.answer(WELCOME_TEXT, reply_markup=main_menu())
 
 
