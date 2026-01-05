@@ -36,6 +36,7 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -46,8 +47,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
-from aiogram.client.default import DefaultBotProperties
-
 
 # ---------------------------
 # Config (ENV)
@@ -63,14 +62,10 @@ LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
 OCR_LANG = os.getenv("OCR_LANG", "rus+eng").strip()
 
-# LLM robustness
 OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "40"))
 MAX_IMAGE_W_LLM = int(os.getenv("MAX_IMAGE_W_LLM", "1600"))
 ASCII_WIDTH = int(os.getenv("ASCII_WIDTH", "34"))  # tuned for phone width
-
-# Telegram limits: keep progress message compact
 PROGRESS_EDIT_INTERVAL = 0.35
-
 
 # ---------------------------
 # Optional OCR
@@ -82,22 +77,12 @@ try:
 except Exception:
     TESSERACT_AVAILABLE = False
 
-
 # ---------------------------
 # Simple per-user state
 # ---------------------------
 
-USER_LANG: Dict[int, str] = {}        # "EN" / "RU"
-RUNNING_TASK: Dict[int, asyncio.Task] = {}  # chat_id -> task
-
-
-def lang_of(chat_id: int) -> str:
-    return USER_LANG.get(chat_id, "EN")
-
-
-def t(chat_id: int, en: str, ru: str) -> str:
-    return en if lang_of(chat_id) == "EN" else ru
-
+USER_LANG: Dict[int, str] = {}  # "EN" / "RU"
+RUNNING_ANIM: Dict[int, asyncio.Task] = {}  # chat_id -> animation task
 
 # ---------------------------
 # Safe HTML helpers
@@ -111,13 +96,19 @@ def h(text: str) -> str:
     return py_html.escape(text, quote=False)
 
 
+def lang_of(chat_id: int) -> str:
+    return USER_LANG.get(chat_id, "EN")
+
+
+def t(chat_id: int, en: str, ru: str) -> str:
+    return en if lang_of(chat_id) == "EN" else ru
+
+
 # ---------------------------
 # Keyboards
 # ---------------------------
 
 def main_menu_kb(chat_id: int) -> ReplyKeyboardMarkup:
-    # Want last two buttons in one row if possible.
-    # Telegram ReplyKeyboard rows are arrays.
     review = t(chat_id, "Send for review", "Закинуть на ревью")
     how = t(chat_id, "How it works?", "Как это работает?")
     channel = t(chat_id, "Channel: @prodooktovy", "Канал: @prodooktovy")
@@ -143,57 +134,57 @@ def cancel_inline_kb(chat_id: int) -> InlineKeyboardMarkup:
 
 
 # ---------------------------
-# ASCII animation (compact + retro)
+# ASCII animation (compact + retro) — FIXED (triple-quoted strings)
 # ---------------------------
 
 FRAMES = [
-    r"┌──────────────────┐
+    r"""┌──────────────────┐
 │  SCANNING  .      │
 │  [=         ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  ..     │
 │  [==        ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  ...    │
 │  [===       ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  ....   │
 │  [====      ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  .....  │
 │  [=====     ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  ...... │
 │  [======    ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  ...... │
 │  [=======   ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  .....  │
 │  [========  ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  ....   │
 │  [========= ]     │
-└──────────────────┘",
-    r"┌──────────────────┐
+└──────────────────┘""",
+    r"""┌──────────────────┐
 │  SCANNING  ...    │
 │  [==========]     │
-└──────────────────┘",
+└──────────────────┘""",
 ]
 
 
 async def animate_progress(anchor: Message, title: str, chat_id: int) -> Message:
     """
-    Sends a compact progress message and edits it with ASCII frames.
-    Returns the progress message (to edit or delete later).
+    Sends 1 progress message and edits it with ASCII frames.
+    Compact to avoid chat spam.
     """
     msg = await anchor.answer(
         f"{h(title)}\n<pre>{h(FRAMES[0])}</pre>",
@@ -219,17 +210,17 @@ async def animate_progress(anchor: Message, title: str, chat_id: int) -> Message
                     disable_web_page_preview=True,
                 )
             except Exception:
-                # Telegram sometimes rejects edits; ignore and continue
+                # Sometimes Telegram rejects edits; ignore
                 pass
             await asyncio.sleep(PROGRESS_EDIT_INTERVAL)
 
     task = asyncio.create_task(_runner())
-    RUNNING_TASK[chat_id] = task
+    RUNNING_ANIM[chat_id] = task
     return msg
 
 
 def stop_progress(chat_id: int) -> None:
-    task = RUNNING_TASK.pop(chat_id, None)
+    task = RUNNING_ANIM.pop(chat_id, None)
     if task and not task.done():
         task.cancel()
 
@@ -253,7 +244,6 @@ def downscale_for_llm(img_bytes: bytes, max_w: int) -> bytes:
 
 
 def img_bytes_to_b64_png(img_bytes: bytes) -> str:
-    # Ensure PNG for consistent decoding.
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     out = io.BytesIO()
     img.save(out, format="PNG", optimize=True)
@@ -272,9 +262,6 @@ async def fetch_figma_preview_image(figma_url: str) -> Tuple[Optional[bytes], Op
     Fetches thumbnail via Figma oEmbed (public files).
     Returns (image_bytes, title) or (None, None).
     """
-    # Cache-bust to avoid "same result for every link" issues
-    # (and to avoid accidental reuse of previous thumbnail).
-    busted_url = figma_url
     sep = "&" if "?" in figma_url else "?"
     busted_url = f"{figma_url}{sep}ts={int(time.time()*1000)}"
 
@@ -291,7 +278,6 @@ async def fetch_figma_preview_image(figma_url: str) -> Tuple[Optional[bytes], Op
             if not thumb:
                 return None, title
 
-        # Download thumbnail
         async with session.get(thumb) as r2:
             if r2.status != 200:
                 return None, title
@@ -299,7 +285,7 @@ async def fetch_figma_preview_image(figma_url: str) -> Tuple[Optional[bytes], Op
 
 
 # ---------------------------
-# OCR & annotation (numbers on text blocks)
+# OCR & annotation
 # ---------------------------
 
 @dataclass
@@ -318,7 +304,6 @@ def ocr_extract_boxes(img_bytes: bytes, lang: str) -> List[TextBox]:
         return []
 
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    # Tesseract gives boxes in the current image pixel space; we draw on the same image => no shifting.
     data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT)  # type: ignore
     n = len(data.get("text", []))
     boxes: List[TextBox] = []
@@ -330,25 +315,22 @@ def ocr_extract_boxes(img_bytes: bytes, lang: str) -> List[TextBox]:
             conf = int(float(data["conf"][i]))
         except Exception:
             conf = -1
-
-        # filter noisy boxes
         if conf < 55:
             continue
+
         x = int(data["left"][i])
         y = int(data["top"][i])
         w = int(data["width"][i])
         h_ = int(data["height"][i])
+
         if w <= 6 or h_ <= 6:
             continue
-        # Avoid random punctuation-only
         if len(re.sub(r"[\W_]+", "", txt, flags=re.UNICODE)) == 0:
             continue
 
         boxes.append(TextBox(idx=len(boxes) + 1, text=txt, x=x, y=y, w=w, h=h_, conf=conf))
 
-    # sort top-to-bottom left-to-right to stabilize numbering
     boxes.sort(key=lambda b: (b.y, b.x))
-    # re-number
     for j, b in enumerate(boxes, start=1):
         b.idx = j
     return boxes
@@ -360,20 +342,16 @@ def draw_annotations(img_bytes: bytes, boxes: List[TextBox]) -> Optional[bytes]:
 
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     draw = ImageDraw.Draw(img)
-
-    # Use built-in default font (works everywhere)
     font = ImageFont.load_default()
 
-    for b in boxes[:40]:  # don’t spam
-        # Black frame (clean, not "red screaming")
+    for b in boxes[:40]:
         x1, y1 = b.x, b.y
         x2, y2 = b.x + b.w, b.y + b.h
         for t_ in range(2):
             draw.rectangle([x1 - t_, y1 - t_, x2 + t_, y2 + t_], outline=(0, 0, 0))
 
         label = str(b.idx)
-        # small white label background
-        tw, th = draw.textsize(label, font=font)
+        tw, th = draw.textsize(label, font=font)  # pillow compatibility
         pad = 2
         draw.rectangle([x1, y1 - th - 2 * pad, x1 + tw + 2 * pad, y1], fill=(255, 255, 255))
         draw.text((x1 + pad, y1 - th - pad), label, fill=(0, 0, 0), font=font)
@@ -386,7 +364,6 @@ def draw_annotations(img_bytes: bytes, boxes: List[TextBox]) -> Optional[bytes]:
 def join_box_snippets(boxes: List[TextBox], max_items: int = 24) -> str:
     lines = []
     for b in boxes[:max_items]:
-        # keep short
         txt = b.text
         if len(txt) > 40:
             txt = txt[:37] + "…"
@@ -395,32 +372,28 @@ def join_box_snippets(boxes: List[TextBox], max_items: int = 24) -> str:
 
 
 # ---------------------------
-# ASCII concept generator (fallback + post-processing)
+# ASCII concept helpers
 # ---------------------------
 
 def wrap_ascii_lines(s: str, width: int) -> str:
-    # Keep lines <= width, avoid breaking ASCII box borders too aggressively.
     out_lines = []
     for line in s.splitlines():
         if len(line) <= width:
             out_lines.append(line)
             continue
-        # hard wrap
         for i in range(0, len(line), width):
             out_lines.append(line[i:i + width])
     return "\n".join(out_lines)
 
 
 def fallback_concept_ascii(width: int) -> str:
-    # Simple "concept" when image generation service is unavailable.
-    # Must fit phone: width ~34 chars
     base = [
         "┌" + "─" * (width - 2) + "┐",
         "│" + "  CLEANER HIERARCHY".ljust(width - 2) + "│",
         "│" + "  • 1 primary action".ljust(width - 2) + "│",
         "│" + "  • fewer competing labels".ljust(width - 2) + "│",
         "│" + "  • consistent spacing".ljust(width - 2) + "│",
-        "│" + "  • calm copy, no бюрократия".ljust(width - 2) + "│",
+        "│" + "  • calmer copy".ljust(width - 2) + "│",
         "│" + "".ljust(width - 2) + "│",
         "│" + "  [ PRIMARY ]".ljust(width - 2) + "│",
         "│" + "  secondary link".ljust(width - 2) + "│",
@@ -437,9 +410,6 @@ OPENAI_ENDPOINT = "https://api.openai.com/v1/responses"
 
 
 def build_prompt(chat_id: int, ocr_snippet: str) -> str:
-    # Strictly ask for sections with markers; no JSON.
-    # Tone: senior buddy, honest, no swearing.
-    # No RGB/px stats; only guess font family (broad).
     return t(
         chat_id,
         en=(
@@ -455,11 +425,10 @@ def build_prompt(chat_id: int, ocr_snippet: str) -> str:
             "===ASCII_CONCEPT===\n\n"
             "Requirements:\n"
             "- Give an overall score 0–10.\n"
-            "- For fonts/palette: only GUESS the font family vibe (e.g., 'looks like Inter/SF/Roboto'), no pixel sizes, no color values.\n"
+            "- Fonts/palette: only GUESS the font family vibe (e.g., 'looks like Inter/SF/Roboto'), no pixel sizes, no color values.\n"
             "- If something is good, praise it and say what exactly.\n"
             "- If something is bad, call it out clearly and propose fixes.\n"
-            "- ASCII_CONCEPT must be a neat monospace block, max line length "
-            f"{ASCII_WIDTH} characters.\n\n"
+            f"- ASCII_CONCEPT must be neat monospace, max line length {ASCII_WIDTH} chars.\n\n"
             "OCR snippet (may be incomplete):\n"
             f"{ocr_snippet}\n"
         ),
@@ -476,11 +445,10 @@ def build_prompt(chat_id: int, ocr_snippet: str) -> str:
             "===ASCII_CONCEPT===\n\n"
             "Требования:\n"
             "- Общая оценка 0–10.\n"
-            "- Про шрифты/палитру: только ПРЕДПОЛОЖЕНИЕ про семейство (Inter/SF/Roboto и т.п.), без размеров/цветов.\n"
-            "- Если хорошо — похвали и скажи, что именно хорошо.\n"
-            "- Если плохо — назови косяк прямо и предложи улучшение.\n"
-            "- ASCII_CONCEPT — аккуратный моноширинный блок, длина строки максимум "
-            f"{ASCII_WIDTH} символов.\n\n"
+            "- Про шрифты/палитру: только предположение про семейство (Inter/SF/Roboto и т.п.), без размеров/цветов.\n"
+            "- Если хорошо — похвали и скажи, что именно.\n"
+            "- Если плохо — назови косяк и предложи улучшение.\n"
+            f"- ASCII_CONCEPT — моноширинный блок, длина строки максимум {ASCII_WIDTH} символов.\n\n"
             "OCR-сниппет (может быть неполным):\n"
             f"{ocr_snippet}\n"
         ),
@@ -488,10 +456,6 @@ def build_prompt(chat_id: int, ocr_snippet: str) -> str:
 
 
 async def openai_review(chat_id: int, img_bytes: bytes, ocr_snippet: str) -> Tuple[str, str, str, str]:
-    """
-    Returns 4 sections: what_i_see, verdict, text_issues, ascii_concept
-    Raises on errors so caller can fallback.
-    """
     if not OPENAI_API_KEY or not LLM_ENABLED:
         raise RuntimeError("LLM disabled or missing key")
 
@@ -520,76 +484,63 @@ async def openai_review(chat_id: int, img_bytes: bytes, ocr_snippet: str) -> Tup
     timeout = aiohttp.ClientTimeout(total=OPENAI_TIMEOUT_S)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(OPENAI_ENDPOINT, headers=headers, data=json.dumps(payload)) as r:
-            txt = await r.text()
+            body = await r.text()
             if r.status != 200:
-                # Raise with exact reason for logs
-                raise RuntimeError(f"OpenAI {r.status}: {txt[:800]}")
-            data = json.loads(txt)
+                raise RuntimeError(f"OpenAI {r.status}: {body[:1200]}")
+            data = json.loads(body)
 
-    # Responses API: try common shapes
-    # We want the final text output.
     out_text = ""
-    # 1) output_text convenience
     if isinstance(data, dict) and data.get("output_text"):
         out_text = data["output_text"]
-    # 2) output array with content blocks
+
     if not out_text and isinstance(data, dict):
         out = data.get("output", [])
         parts = []
         for item in out:
-            content = item.get("content", []) if isinstance(item, dict) else []
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", [])
+            if not isinstance(content, list):
+                continue
             for c in content:
-                if c.get("type") in ("output_text", "summary_text") and "text" in c:
+                if isinstance(c, dict) and c.get("type") in ("output_text", "summary_text") and "text" in c:
                     parts.append(c["text"])
         out_text = "\n".join(parts).strip()
 
     if not out_text:
         raise RuntimeError("OpenAI returned empty output")
 
-    # Parse sections
     def pick(section: str) -> str:
         m = re.search(rf"==={re.escape(section)}===\s*(.*?)(?=\n===|$)", out_text, flags=re.S)
         return (m.group(1).strip() if m else "").strip()
 
-    what_i_see = pick("WHAT_I_SEE")
-    verdict = pick("VERDICT_AND_RECOMMENDATIONS")
-    text_issues = pick("TEXT_ISSUES_AND_FIXES")
-    concept = pick("ASCII_CONCEPT")
-
-    # Clean typical "['text']" garbage if model accidentally prints python-ish lists
     def strip_list_repr(s: str) -> str:
         s2 = s.strip()
         if (s2.startswith("['") and s2.endswith("']")) or (s2.startswith('["') and s2.endswith('"]')):
             s2 = s2[2:-2]
         return s2.strip()
 
-    what_i_see = strip_list_repr(what_i_see)
-    verdict = strip_list_repr(verdict)
-    text_issues = strip_list_repr(text_issues)
-    concept = strip_list_repr(concept)
+    what_i_see = strip_list_repr(pick("WHAT_I_SEE"))
+    verdict = strip_list_repr(pick("VERDICT_AND_RECOMMENDATIONS"))
+    text_issues = strip_list_repr(pick("TEXT_ISSUES_AND_FIXES"))
+    concept = strip_list_repr(pick("ASCII_CONCEPT"))
 
     if not concept:
         concept = fallback_concept_ascii(ASCII_WIDTH)
 
-    # Enforce width to avoid phone wrapping
     concept = wrap_ascii_lines(concept, ASCII_WIDTH)
 
-    # Guard: if model forgot sections, treat as failure -> fallback
     if not (what_i_see and verdict and text_issues):
         raise RuntimeError("LLM output missing sections")
 
     return what_i_see, verdict, text_issues, concept
 
 
-# ---------------------------
-# Fallback review (OCR-only)
-# ---------------------------
-
 def fallback_review(chat_id: int, boxes: List[TextBox]) -> Tuple[str, str, str, str]:
     snippet = join_box_snippets(boxes) if boxes else ""
     what_i_see = t(
         chat_id,
-        en="I can’t run full AI review right now. I extracted the visible text blocks and will comment based on that.",
+        en="I can’t run full AI review right now. I extracted visible text blocks and will comment based on that.",
         ru="Сейчас не могу сделать полный AI-разбор. Я вытащил видимые текстовые блоки и дам комментарии по ним.",
     )
 
@@ -632,85 +583,65 @@ def fallback_review(chat_id: int, boxes: List[TextBox]) -> Tuple[str, str, str, 
 async def process_review_from_image(m: Message, img_bytes: bytes) -> None:
     chat_id = m.chat.id
 
-    # Start animation
     title = t(chat_id, "Review in progress…", "Идёт ревью…")
     progress = await animate_progress(m, title=title, chat_id=chat_id)
 
     try:
-        # OCR (for annotations + snippet)
         boxes = ocr_extract_boxes(img_bytes, OCR_LANG) if TESSERACT_AVAILABLE else []
         ocr_snip = join_box_snippets(boxes) if boxes else ""
 
-        # LLM review (downscale for stability)
-        what_i_see = verdict = text_issues = concept = ""
         try:
             img_llm = downscale_for_llm(img_bytes, MAX_IMAGE_W_LLM)
             what_i_see, verdict, text_issues, concept = await openai_review(chat_id, img_llm, ocr_snip)
         except Exception as e:
-            # Log exact error (Railway)
             print("[LLM ERROR]", type(e).__name__, str(e)[:1200])
             what_i_see, verdict, text_issues, concept = fallback_review(chat_id, boxes)
 
-        # Stop animation
         stop_progress(chat_id)
         try:
             await progress.edit_text(t(chat_id, "Done.", "Готово."), reply_markup=None)
         except Exception:
             pass
 
-        # Message 1: what I see
+        # 1) What I see
         await m.answer(h(what_i_see), reply_markup=None, disable_web_page_preview=True)
 
-        # Message 2: verdict + recs + text in one (as requested previously)
+        # 2) Verdict + recs (UX + text combined)
         combined = f"{verdict}\n\n{text_issues}".strip()
         await m.answer(h(combined), reply_markup=None, disable_web_page_preview=True)
 
-        # Message 3: annotated screenshot (numbers match OCR blocks)
+        # 3) Annotated screenshot
         annotated = draw_annotations(img_bytes, boxes) if boxes else None
         if annotated:
-            caption = t(
+            cap = t(
                 chat_id,
-                en="Annotated text blocks (OCR). Numbers match the extracted list.",
-                ru="Аннотации текстовых блоков (OCR). Номера совпадают со списком.",
+                "Annotated text blocks (OCR). Numbers match the extracted list.",
+                "Аннотации текстовых блоков (OCR). Номера совпадают со списком.",
             )
-            await m.answer_photo(
-                photo=annotated,
-                caption=caption,
-                reply_markup=None,
-            )
+            await m.answer_photo(photo=annotated, caption=cap, reply_markup=None)
         else:
             await m.answer(
                 t(chat_id, "No readable text blocks detected for annotation.", "Не нашёл читаемых текстовых блоков для аннотаций."),
                 reply_markup=None,
             )
 
-        # Between 3 and 4: small extra animation (keep it short)
+        # Extra short animation before concept
         title2 = t(chat_id, "Drafting an ASCII concept…", "Собираю ASCII-концепт…")
         progress2 = await animate_progress(m, title=title2, chat_id=chat_id)
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.1)
         stop_progress(chat_id)
         try:
             await progress2.edit_text(t(chat_id, "Concept ready.", "Концепт готов."), reply_markup=None)
         except Exception:
             pass
 
-        # Message 4: ASCII concept (monospace <pre>)
+        # 4) ASCII concept (monospace)
         concept = wrap_ascii_lines(concept, ASCII_WIDTH)
-        await m.answer(
-            f"<pre>{h(concept)}</pre>",
-            reply_markup=None,
-            disable_web_page_preview=True,
-        )
+        await m.answer(f"<pre>{h(concept)}</pre>", reply_markup=None, disable_web_page_preview=True)
 
     finally:
-        # Ensure progress stops even on unexpected errors
         stop_progress(chat_id)
-        # Show menu only at the end of review
-        await m.answer(
-            t(chat_id, "Menu:", "Меню:"),
-            reply_markup=main_menu_kb(chat_id),
-            disable_web_page_preview=True,
-        )
+        await m.answer(t(chat_id, "Menu:", "Меню:"), reply_markup=main_menu_kb(chat_id), disable_web_page_preview=True)
 
 
 async def process_review_from_figma_link(m: Message, url: str) -> None:
@@ -738,13 +669,11 @@ async def process_review_from_figma_link(m: Message, url: str) -> None:
             )
             return
 
-        # Show preview image first (user asked)
         cap = t(chat_id, "Figma preview:", "Превью Figma:")
         if fig_title:
             cap += f" {fig_title}"
         await m.answer_photo(photo=img_bytes, caption=cap)
 
-        # Then run review on that preview
         await process_review_from_image(m, img_bytes)
 
     finally:
@@ -752,7 +681,7 @@ async def process_review_from_figma_link(m: Message, url: str) -> None:
 
 
 # ---------------------------
-# Router handlers
+# Dispatcher / Handlers
 # ---------------------------
 
 dp = Dispatcher()
@@ -761,7 +690,6 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def on_start(m: Message):
     chat_id = m.chat.id
-    # EN default
     USER_LANG.setdefault(chat_id, "EN")
     text = t(
         chat_id,
@@ -775,20 +703,10 @@ async def on_start(m: Message):
     await m.answer(h(text), reply_markup=main_menu_kb(chat_id), disable_web_page_preview=True)
 
 
-@dp.message(Command("menu"))
-async def on_menu(m: Message):
-    chat_id = m.chat.id
-    await m.answer(t(chat_id, "Menu:", "Меню:"), reply_markup=main_menu_kb(chat_id))
-
-
 @dp.callback_query(F.data == "cancel")
 async def on_cancel(cb: CallbackQuery):
     chat_id = cb.message.chat.id if cb.message else cb.from_user.id
     stop_progress(chat_id)
-    # Cancel running task if any
-    task = RUNNING_TASK.get(chat_id)
-    if task and not task.done():
-        task.cancel()
     try:
         await cb.answer(t(chat_id, "Cancelled.", "Отменено."), show_alert=False)
     except Exception:
@@ -801,26 +719,42 @@ async def on_cancel(cb: CallbackQuery):
         await cb.message.answer(t(chat_id, "Stopped. Back to menu.", "Остановил. Возвращаю меню."), reply_markup=main_menu_kb(chat_id))
 
 
+@dp.message(F.photo)
+async def on_photo(m: Message):
+    photo = m.photo[-1]
+    file = await m.bot.get_file(photo.file_id)
+    stream = await m.bot.download_file(file.file_path)
+    img_bytes = stream.getvalue() if hasattr(stream, "getvalue") else stream
+    await process_review_from_image(m, img_bytes)
+
+
+@dp.message(F.document)
+async def on_document(m: Message):
+    chat_id = m.chat.id
+    doc = m.document
+    if not doc or not (doc.mime_type or "").startswith("image/"):
+        await m.answer(t(chat_id, "Send an image file.", "Пришли картинку."), reply_markup=main_menu_kb(chat_id))
+        return
+    file = await m.bot.get_file(doc.file_id)
+    stream = await m.bot.download_file(file.file_path)
+    img_bytes = stream.getvalue() if hasattr(stream, "getvalue") else stream
+    await process_review_from_image(m, img_bytes)
+
+
 @dp.message()
 async def on_text(m: Message):
     chat_id = m.chat.id
     txt = (m.text or "").strip()
 
-    # Channel button
     if txt == t(chat_id, "Channel: @prodooktovy", "Канал: @prodooktovy"):
         await m.answer("@prodooktovy", disable_web_page_preview=True, reply_markup=main_menu_kb(chat_id))
         return
 
-    # Language toggle
     if txt == t(chat_id, "Language: EN/RU", "Язык: EN/RU"):
         USER_LANG[chat_id] = "RU" if lang_of(chat_id) == "EN" else "EN"
-        await m.answer(
-            t(chat_id, "Language switched.", "Язык переключён."),
-            reply_markup=main_menu_kb(chat_id),
-        )
+        await m.answer(t(chat_id, "Language switched.", "Язык переключён."), reply_markup=main_menu_kb(chat_id))
         return
 
-    # How it works
     if txt == t(chat_id, "How it works?", "Как это работает?"):
         await m.answer(
             h(
@@ -838,7 +772,6 @@ async def on_text(m: Message):
         )
         return
 
-    # Send for review button (just instruction)
     if txt == t(chat_id, "Send for review", "Закинуть на ревью"):
         await m.answer(
             h(
@@ -852,14 +785,11 @@ async def on_text(m: Message):
         )
         return
 
-    # Figma link
     murl = FIGMA_URL_RE.search(txt)
     if murl:
-        url = murl.group(1)
-        await process_review_from_figma_link(m, url)
+        await process_review_from_figma_link(m, murl.group(1))
         return
 
-    # Default
     await m.answer(
         h(
             t(
@@ -871,35 +801,6 @@ async def on_text(m: Message):
         reply_markup=main_menu_kb(chat_id),
         disable_web_page_preview=True,
     )
-
-
-@dp.message(F.photo)
-async def on_photo(m: Message):
-    chat_id = m.chat.id
-
-    # Telegram gives multiple sizes; pick the largest
-    photo = m.photo[-1]
-    file = await m.bot.get_file(photo.file_id)
-    img_bytes = await m.bot.download_file(file.file_path)
-
-    await process_review_from_image(m, img_bytes.getvalue() if hasattr(img_bytes, "getvalue") else img_bytes)
-
-
-@dp.message(F.document)
-async def on_document(m: Message):
-    chat_id = m.chat.id
-    doc = m.document
-    if not doc:
-        return
-    # Allow image documents only
-    if not (doc.mime_type or "").startswith("image/"):
-        await m.answer(t(chat_id, "Send an image file.", "Пришли картинку."), reply_markup=main_menu_kb(chat_id))
-        return
-
-    file = await m.bot.get_file(doc.file_id)
-    img_bytes = await m.bot.download_file(file.file_path)
-
-    await process_review_from_image(m, img_bytes.getvalue() if hasattr(img_bytes, "getvalue") else img_bytes)
 
 
 # ---------------------------
