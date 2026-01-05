@@ -1,737 +1,768 @@
+# bot.py
+# Design Reviewer Telegram bot (Aiogram 3.7+)
+# - Accepts screenshots (photos) and public Figma links (via oEmbed thumbnail)
+# - Shows compact retro ASCII progress animation (loops until done)
+# - Sends 4 outputs:
+#   1) What I see
+#   2) Verdict + recommendations
+#   3) Annotated screenshot (boxes from LLM)
+#   4) ASCII wireframe concept (monospace, width-limited to avoid mobile wrapping)
+# - EN by default, RU toggle
+# - Menu shown only after /start and at the end of each review
+# - Cancel button works during processing
+
 import asyncio
 import base64
+import io
 import json
 import os
 import re
 import time
-from io import BytesIO
+import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+from PIL import Image, ImageDraw, ImageFont
+
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import (
-    BufferedInputFile,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    BufferedInputFile,
 )
-from PIL import Image, ImageDraw, ImageFont
+from aiogram.client.default import DefaultBotProperties
+
 from openai import OpenAI
 
 
-# =========================
+# ----------------------------
 # Config
-# =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini").strip()
+# ----------------------------
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("Set BOT_TOKEN env var")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY env var")
+    raise RuntimeError("Set BOT_TOKEN in environment (Railway Variables or local export).")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-router = Router()
 
-# =========================
+# ----------------------------
 # State (in-memory)
-# =========================
-USER_LANG: Dict[int, str] = {}  # "en" | "ru"
-RUNNING_TASKS: Dict[int, asyncio.Task] = {}
-CANCEL_FLAGS: Dict[int, bool] = {}
+# ----------------------------
 
-# =========================
-# UI strings
-# =========================
-STR = {
-    "en": {
-        "hello_title": "Design Reviewer (retro edition)",
-        "hello_body": (
-            "I’m your picky design buddy.\n\n"
-            "Send me:\n"
-            "• a UI screenshot\n"
-            "• a Figma frame link (public file)\n\n"
-            "I’ll reply with:\n"
-            "1) what I see\n"
-            "2) verdict + recommendations\n"
-            "3) annotated screenshot\n"
-            "4) an ASCII wireframe concept\n"
-        ),
-        "btn_review": "Drop for review",
-        "btn_how": "How it works?",
-        "btn_lang": "EN/RU",
-        "btn_cancel": "Cancel",
-        "btn_channel": "@prodooktovy",
-        "how": (
-            "How it works:\n"
-            "1) Send a screenshot or a public Figma frame link\n"
-            "2) Watch the retro progress\n"
-            "3) Get a blunt review + annotated screenshot + ASCII wireframe"
-        ),
-        "need_input": "Send me a screenshot or a public Figma frame link.",
-        "cancelled": "Cancelled. Send another screenshot/link when ready.",
-        "busy": "I’m already reviewing something. Hit Cancel if you want to stop it.",
-        "llm_fail": "LLM error. Try again (or send a clearer / larger screenshot).",
-        "score": "Score",
-        "whatisee": "What I see",
-        "verdict": "Verdict & recommendations",
-        "annotated": "Annotated",
-        "concept": "ASCII wireframe concept",
-    },
-    "ru": {
-        "hello_title": "Design Reviewer (retro edition)",
-        "hello_body": (
-            "Я твой придирчивый дизайн-товарищ.\n\n"
-            "Кидай сюда:\n"
-            "• скрин интерфейса\n"
-            "• ссылку на фрейм Figma (если файл публичный)\n\n"
-            "Я отвечу:\n"
-            "1) что вижу\n"
-            "2) вердикт + рекомендации\n"
-            "3) аннотированный скрин\n"
-            "4) ASCII wireframe-концепт\n"
-        ),
-        "btn_review": "Закинуть на ревью",
-        "btn_how": "Как это работает?",
-        "btn_lang": "EN/RU",
-        "btn_cancel": "Отмена",
-        "btn_channel": "@prodooktovy",
-        "how": (
-            "Как это работает:\n"
-            "1) Отправь скрин или ссылку на публичный фрейм Figma\n"
-            "2) Посмотри ретро-прогресс\n"
-            "3) Получи ревью + аннотированный скрин + ASCII wireframe"
-        ),
-        "need_input": "Пришли скриншот или ссылку на публичный фрейм Figma.",
-        "cancelled": "Отменено. Пришли следующий скрин/ссылку, когда будешь готов.",
-        "busy": "Я уже в процессе ревью. Нажми Отмена, если хочешь остановить.",
-        "llm_fail": "Ошибка LLM. Попробуй ещё раз (или пришли скрин крупнее/четче).",
-        "score": "Оценка",
-        "whatisee": "Что я вижу",
-        "verdict": "Вердикт и рекомендации",
-        "annotated": "Аннотации",
-        "concept": "ASCII wireframe-концепт",
-    },
-}
+LANG: Dict[int, str] = {}  # user_id -> "en" / "ru"
+CANCEL_FLAGS: Dict[int, bool] = {}  # user_id -> True when cancelled
+RUNNING_TASK: Dict[int, asyncio.Task] = {}  # user_id -> running processing task
 
 
-# =========================
-# Helpers
-# =========================
-def lang_for(user_id: int) -> str:
-    return USER_LANG.get(user_id, "en")
+# ----------------------------
+# Helpers: i18n + HTML escaping
+# ----------------------------
+
+def lang_for(uid: int) -> str:
+    return LANG.get(uid, "en")
 
 
-def t(user_id: int, key: str) -> str:
-    return STR[lang_for(user_id)][key]
+def set_lang(uid: int, value: str) -> None:
+    LANG[uid] = "ru" if value == "ru" else "en"
 
 
 def escape_html(s: str) -> str:
     return (
-        (s or "")
-        .replace("&", "&amp;")
+        s.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
 
 
-def main_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    L = lang_for(user_id)
+TXT = {
+    "en": {
+        "title": "Design Reviewer",
+        "start": (
+            "I'm your design review partner.\n\n"
+            "Send me:\n"
+            "• screenshots (images)\n"
+            "• Figma frame links (public files)\n\n"
+            "Tap “Submit for review” or just send a screenshot/link."
+        ),
+        "how": (
+            "How it works:\n"
+            "1) Send a screenshot or a public Figma frame link\n"
+            "2) I analyze what’s on the screen\n"
+            "3) I give a tough-but-fair review + a wireframe concept"
+        ),
+        "need_input": "Send a screenshot or a public Figma frame link.",
+        "cancelled": "Cancelled.",
+        "busy": "I’m already reviewing something. Hit Cancel, or wait for the result.",
+        "no_llm": "LLM is disabled (no OPENAI_API_KEY). Add it to Railway Variables.",
+        "llm_fail": "LLM error. Try again (or send a clearer / larger screenshot).",
+        "not_image": "I need a screenshot image or a Figma link.",
+        "figma_fetch_fail": "Couldn’t fetch a preview from that Figma link. Make sure the file is public.",
+        "whatisee": "What I see",
+        "verdict": "Verdict & recommendations",
+        "annotated": "Annotated screenshot",
+        "concept": "Wireframe concept (ASCII)",
+        "score": "Score",
+        "channel_msg": "Channel:",
+        "open_channel": "Open @prodooktovy",
+        "menu_submit": "Submit for review",
+        "menu_how": "How it works?",
+        "menu_lang": "Language: EN/RU",
+        "menu_channel": "@prodooktovy",
+        "btn_cancel": "Cancel",
+        "progress_title": "Review in progress",
+        "progress_wire": "Drafting wireframe",
+        "preview": "Preview",
+    },
+    "ru": {
+        "title": "Design Reviewer",
+        "start": (
+            "Я твой партнёр по дизайн-ревью.\n\n"
+            "Принимаю:\n"
+            "• скриншоты (картинки)\n"
+            "• ссылки на фреймы Figma (если файл публичный)\n\n"
+            "Жми «Закинуть на ревью» или просто отправь скрин/ссылку."
+        ),
+        "how": (
+            "Как это работает:\n"
+            "1) Отправь скриншот или публичную ссылку на Figma фрейм\n"
+            "2) Я опишу, что вижу на экране\n"
+            "3) Дам честный разбор + черновой вайрфрейм"
+        ),
+        "need_input": "Отправь скриншот или публичную ссылку на Figma фрейм.",
+        "cancelled": "Отменено.",
+        "busy": "Я уже делаю ревью. Нажми Cancel или дождись результата.",
+        "no_llm": "LLM отключён (нет OPENAI_API_KEY). Добавь его в Railway Variables.",
+        "llm_fail": "Ошибка LLM. Попробуй ещё раз (или пришли скрин крупнее/четче).",
+        "not_image": "Мне нужен скриншот или ссылка на Figma.",
+        "figma_fetch_fail": "Не смог скачать превью по ссылке Figma. Убедись, что файл публичный.",
+        "whatisee": "Что я вижу",
+        "verdict": "Вердикт и рекомендации",
+        "annotated": "Аннотации на скрине",
+        "concept": "Wireframe-концепт (ASCII)",
+        "score": "Оценка",
+        "channel_msg": "Канал:",
+        "open_channel": "Открыть @prodooktovy",
+        "menu_submit": "Закинуть на ревью",
+        "menu_how": "Как это работает?",
+        "menu_lang": "Язык: EN/RU",
+        "menu_channel": "@prodooktovy",
+        "btn_cancel": "Cancel",
+        "progress_title": "Ревью в процессе",
+        "progress_wire": "Собираю wireframe",
+        "preview": "Превью",
+    },
+}
+
+
+def t(uid: int, key: str) -> str:
+    return TXT[lang_for(uid)].get(key, key)
+
+
+# ----------------------------
+# Keyboards
+# ----------------------------
+
+def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
+    # 3 buttons total, last row contains channel + language
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t(uid, "menu_submit"))],
+            [KeyboardButton(text=t(uid, "menu_how"))],
+            [KeyboardButton(text=t(uid, "menu_channel")), KeyboardButton(text=t(uid, "menu_lang"))],
+        ],
+        resize_keyboard=True,
+        selective=True,
+        input_field_placeholder=t(uid, "need_input"),
+    )
+
+
+def cancel_kb(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=STR[L]["btn_review"], callback_data="review")],
-            [InlineKeyboardButton(text=STR[L]["btn_how"], callback_data="how")],
-            [
-                InlineKeyboardButton(text=STR[L]["btn_channel"], url="https://t.me/prodooktovy"),
-                InlineKeyboardButton(text=STR[L]["btn_lang"], callback_data="toggle_lang"),
-            ],
+            [InlineKeyboardButton(text=t(uid, "btn_cancel"), callback_data=f"cancel:{uid}")]
         ]
     )
 
 
-def cancel_kb(user_id: int) -> InlineKeyboardMarkup:
+def channel_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=t(user_id, "btn_cancel"), callback_data="cancel")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Open @prodooktovy", url="https://t.me/prodooktovy")]
+        ]
     )
 
 
-FIGMA_URL_RE = re.compile(r"https?://(www\.)?figma\.com/(file|design)/[^\s]+", re.IGNORECASE)
+# ----------------------------
+# Progress animation (compact + looping)
+# ----------------------------
 
-
-def extract_figma_url(text: str) -> Optional[str]:
-    m = FIGMA_URL_RE.search(text or "")
-    return m.group(0) if m else None
-
-
-def is_image_message(m: Message) -> bool:
-    return bool(m.photo) or (m.document and (m.document.mime_type or "").startswith("image/"))
-
-
-async def download_tg_image_bytes(m: Message, bot: Bot) -> Optional[bytes]:
-    if m.photo:
-        file_id = m.photo[-1].file_id
-    elif m.document and (m.document.mime_type or "").startswith("image/"):
-        file_id = m.document.file_id
-    else:
-        return None
-    file = await bot.get_file(file_id)
-    bio = BytesIO()
-    await bot.download_file(file.file_path, destination=bio)
-    return bio.getvalue()
-
-
-async def figma_preview_image(figma_url: str) -> Optional[bytes]:
-    """
-    Uses Figma oEmbed (no token) to get thumbnail_url for public files.
-    Avoids caching issues by adding cache-buster.
-    """
-    try:
-        import aiohttp
-        oembed = f"https://www.figma.com/oembed?url={figma_url}&cb={int(time.time()*1000)}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(oembed, timeout=20) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json(content_type=None)
-                thumb = data.get("thumbnail_url") or data.get("thumbnailUrl")
-                if not thumb:
-                    return None
-            async with session.get(thumb + f"&cb={int(time.time()*1000)}", timeout=25) as r2:
-                if r2.status != 200:
-                    return None
-                return await r2.read()
-    except Exception:
-        return None
-
-
-# =========================
-# Retro ASCII progress (compact + fast)
-# =========================
-def retro_bar_frame(step: int, width: int = 18) -> str:
-    # compact, phone-friendly bar
+def retro_bar_frame(step: int, width: int = 16) -> str:
+    # compact retro "scanner" bar
     pos = step % width
     inside = ["·"] * width
     inside[pos] = "█"
-    return "┌" + "─" * width + "┐\n" + "│" + "".join(inside) + "│\n" + "└" + "─" * width + "┘"
+    inside[(pos - 1) % width] = "▓"
+    inside[(pos - 2) % width] = "▒"
+    return (
+        "┌" + "─" * width + "┐\n"
+        "│" + "".join(inside) + "│\n"
+        "└" + "─" * width + "┘"
+    )
 
 
-async def animate_progress(anchor: Message, user_id: int, title: str, seconds: float = 1.8) -> Message:
+async def animate_progress_until_done(
+    anchor: Message,
+    uid: int,
+    title: str,
+    done_event: asyncio.Event,
+    tick: float = 0.12,
+) -> Message:
     """
-    Sends ONE message, then edits it quickly.
-    If edit fails, falls back to sending a new one.
+    Sends ONE message and keeps editing it until done_event is set or cancelled.
     """
-    start = time.time()
     msg = await anchor.answer(
         f"{escape_html(title)}\n<code>{escape_html(retro_bar_frame(0))}</code>",
-        reply_markup=cancel_kb(user_id),
+        reply_markup=cancel_kb(uid),
     )
+
     step = 0
-    while time.time() - start < seconds:
-        if CANCEL_FLAGS.get(user_id):
+    while not done_event.is_set():
+        if CANCEL_FLAGS.get(uid):
             break
         step += 1
         try:
             await msg.edit_text(
                 f"{escape_html(title)}\n<code>{escape_html(retro_bar_frame(step))}</code>",
-                reply_markup=cancel_kb(user_id),
+                reply_markup=cancel_kb(uid),
             )
         except Exception:
-            msg = await anchor.answer(
-                f"{escape_html(title)}\n<code>{escape_html(retro_bar_frame(step))}</code>",
-                reply_markup=cancel_kb(user_id),
-            )
-        await asyncio.sleep(0.11)
+            # "message can't be edited" / throttling / etc — ignore, keep going
+            pass
+        await asyncio.sleep(tick)
+
     return msg
 
 
-# =========================
-# LLM tool schema (strict JSON via function call)
-# =========================
-REVIEW_TOOL = [
-    {
-        "type": "function",
-        "name": "deliver_review",
-        "description": "Return a structured design review for the provided UI screenshot.",
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "language": {"type": "string", "enum": ["en", "ru"]},
-                "score_10": {"type": "integer", "minimum": 1, "maximum": 10},
-                "what_i_see": {"type": "string"},
-                "verdict": {"type": "string"},
-                "boxes": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "label": {"type": "string"},
-                            "x1": {"type": "number", "minimum": 0, "maximum": 1},
-                            "y1": {"type": "number", "minimum": 0, "maximum": 1},
-                            "x2": {"type": "number", "minimum": 0, "maximum": 1},
-                            "y2": {"type": "number", "minimum": 0, "maximum": 1},
-                        },
-                        "required": ["label", "x1", "y1", "x2", "y2"],
-                    },
-                },
-                "ascii_concept": {
-                    "type": "array",
-                    "description": "Monospace ASCII wireframe lines. MUST fit within max_width characters per line.",
-                    "items": {"type": "string"},
-                },
-                "ascii_width": {"type": "integer", "minimum": 20, "maximum": 44},
-                "ascii_height": {"type": "integer", "minimum": 10, "maximum": 90},
-            },
-            "required": ["language", "score_10", "what_i_see", "verdict", "boxes", "ascii_concept", "ascii_width", "ascii_height"],
-        },
-        "strict": True,
-    }
-]
+# ----------------------------
+# Figma: fetch thumbnail via oEmbed (public links)
+# ----------------------------
+
+FIGMA_RE = re.compile(r"https?://www\.figma\.com/(file|design)/[A-Za-z0-9]+/[^?\s]+.*", re.I)
+
+def is_figma_link(text: str) -> bool:
+    return bool(FIGMA_RE.search(text or ""))
 
 
-def clamp01(v: float) -> float:
-    return max(0.0, min(1.0, float(v)))
-
-
-def normalize_boxes(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    for b in raw or []:
-        x1, y1, x2, y2 = clamp01(b["x1"]), clamp01(b["y1"]), clamp01(b["x2"]), clamp01(b["y2"])
-        if x2 < x1:
-            x1, x2 = x2, x1
-        if y2 < y1:
-            y1, y2 = y2, y1
-        if (x2 - x1) < 0.02 or (y2 - y1) < 0.02:
-            continue
-        out.append({"label": str(b["label"])[:28], "x1": x1, "y1": y1, "x2": x2, "y2": y2})
-    return out[:12]
-
-
-def enforce_boxed(lines: List[str], width: int, height: int) -> List[str]:
-    # crop each line, then crop/pad to exact height
-    cleaned = []
-    for ln in (lines or []):
-        ln = (ln or "").rstrip("\n\r")
-        if len(ln) > width:
-            ln = ln[:width]
-        cleaned.append(ln)
-
-    # normalize height
-    if len(cleaned) > height:
-        cleaned = cleaned[:height]
-    while len(cleaned) < height:
-        cleaned.append("")
-
-    # ensure every line has <= width (no wrap)
-    cleaned2 = []
-    for ln in cleaned:
-        if len(ln) > width:
-            cleaned2.append(ln[:width])
-        else:
-            cleaned2.append(ln)
-    return cleaned2
-
-
-def compute_ascii_dims(img_bytes: bytes) -> Tuple[int, int]:
-    """
-    Choose wireframe size that fits phone screens without wrapping.
-    We keep width conservative and derive height from screenshot aspect ratio.
-    """
-    im = Image.open(BytesIO(img_bytes))
-    w, h = im.size
-
-    # safe width for Telegram mobile code blocks:
-    ascii_w = 36  # conservative, avoids wrap on most phones
-
-    # Character cell aspect: approx height ~ 2x width in pixels (monospace)
-    # We want visual ratio to resemble screenshot.
-    # A practical heuristic:
-    # height ≈ (h/w) * ascii_w * 0.55
-    ascii_h = int((h / max(w, 1)) * ascii_w * 0.55)
-
-    # clamp
-    ascii_h = max(16, min(60, ascii_h))
-    return ascii_w, ascii_h
-
-
-def _llm_review_image_sync(img_bytes: bytes, user_id: int, ascii_w: int, ascii_h: int) -> Optional[Dict[str, Any]]:
-    L = lang_for(user_id)
-
-    tone = {
-        "en": (
-            "You are a senior product designer doing a blunt, helpful design review. "
-            "No profanity. Be honest, picky, but fair. Praise what is good. "
-            "Do NOT output technical color codes or pixel measurements. "
-            "You may GUESS font family style only (e.g., 'Inter / SF / Roboto-ish'), no exact sizes. "
-            "Focus on hierarchy, spacing, alignment, clarity, consistency, UX flow, and text quality."
-        ),
-        "ru": (
-            "Ты — сеньор продакт-дизайнер и делаешь жесткое, но полезное ревью. "
-            "Без мата. Честно придирайся, но справедливо. Хорошее — тоже отмечай. "
-            "НЕ давай коды цветов и пиксельные размеры. "
-            "Про шрифт — только предположение семейства (Inter/SF/Roboto-ish), без размеров. "
-            "Фокус: иерархия, сетка, отступы, выравнивание, консистентность, UX и качество текста."
-        ),
-    }[L]
-
-    # Very explicit wireframe guidance
-    wireframe_rules = {
-        "en": (
-            f"ASCII WIREFRAME MUST be useful and clean.\n"
-            f"- Output EXACTLY ascii_height={ascii_h} lines.\n"
-            f"- Each line MUST be <= ascii_width={ascii_w} characters (never exceed).\n"
-            f"- Use box drawing: ┌ ┐ └ ┘ ─ │ and simple UI tokens.\n"
-            f"- Mirror the screenshot structure: header / content / actions.\n"
-            f"- Include meaningful labels (short): Title, Field, Button, Tab, List row.\n"
-            f"- No random art. No filler. Make it shareable.\n"
-        ),
-        "ru": (
-            f"ASCII WIREFRAME должен быть полезным и аккуратным.\n"
-            f"- Верни РОВНО ascii_height={ascii_h} строк.\n"
-            f"- Каждая строка <= ascii_width={ascii_w} символов (никогда не превышай).\n"
-            f"- Используй псевдографику: ┌ ┐ └ ┘ ─ │ и простые UI-токены.\n"
-            f"- Повтори структуру экрана: шапка / контент / действия.\n"
-            f"- Добавь короткие подписи: Заголовок, Поле, Кнопка, Таб, Строка списка.\n"
-            f"- Без рандом-арта и бессмысленных узоров. Должно хотеться шарить.\n"
-        ),
-    }[L]
-
-    instructions = (
-        f"{tone}\n\n"
-        f"Return the result ONLY by calling the tool deliver_review.\n"
-        f"language must be '{L}'.\n\n"
-        f"{wireframe_rules}\n"
-        f"boxes: pick up to 10 UI areas that your recommendations refer to.\n"
-        f"what_i_see + verdict must be in the chosen language.\n"
+def http_get_bytes(url: str, timeout: float = 20.0) -> bytes:
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        method="GET",
     )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
 
-    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+def fetch_figma_thumbnail(figma_url: str) -> Optional[bytes]:
+    # cache-bust to avoid "same result for every link" in some proxy/CDN layers
+    bust = str(int(time.time() * 1000))
+    oembed = "https://www.figma.com/oembed?url=" + urllib.parse.quote(figma_url, safe="")
+    oembed += ("&cb=" + bust)
 
     try:
-        resp = client.responses.create(
-            model=LLM_MODEL,
-            tools=REVIEW_TOOL,
-            input=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Review this UI screenshot."},
-                        {"type": "input_image", "image_url": f"data:image/png;base64,{img_b64}"},
-                    ],
-                }
-            ],
-            instructions=instructions,
-        )
-
-        for item in resp.output:
-            if getattr(item, "type", None) == "function_call" and getattr(item, "name", "") == "deliver_review":
-                args = json.loads(item.arguments)
-                args["boxes"] = normalize_boxes(args.get("boxes", []))
-                args["ascii_width"] = min(int(args.get("ascii_width", ascii_w)), ascii_w)
-                args["ascii_height"] = min(int(args.get("ascii_height", ascii_h)), ascii_h)
-                args["ascii_concept"] = enforce_boxed(args.get("ascii_concept", []), args["ascii_width"], args["ascii_height"])
-                return args
-
-        return None
+        raw = http_get_bytes(oembed, timeout=20.0)
+        data = json.loads(raw.decode("utf-8", errors="ignore"))
+        thumb = data.get("thumbnail_url")
+        if not thumb:
+            return None
+        # additional cache-bust on thumbnail url
+        sep = "&" if "?" in thumb else "?"
+        thumb2 = thumb + f"{sep}cb={bust}"
+        return http_get_bytes(thumb2, timeout=25.0)
     except Exception:
         return None
 
 
-async def llm_review_image(img_bytes: bytes, user_id: int, ascii_w: int, ascii_h: int) -> Optional[Dict[str, Any]]:
-    """
-    IMPORTANT: run blocking OpenAI call in a thread so Cancel button works.
-    """
-    return await asyncio.to_thread(_llm_review_image_sync, img_bytes, user_id, ascii_w, ascii_h)
+# ----------------------------
+# Image: annotations + ascii width control
+# ----------------------------
+
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
 
-# =========================
-# Annotation drawing
-# =========================
-def pick_font(size: int = 14) -> ImageFont.ImageFont:
-    for path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/Library/Fonts/Arial.ttf",
-    ]:
+def _text_bbox(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
+    # Pillow 10+: prefer textbbox
+    try:
+        box = draw.textbbox((0, 0), text, font=font)
+        return (box[2] - box[0], box[3] - box[1])
+    except Exception:
+        # fallback
         try:
-            return ImageFont.truetype(path, size=size)
+            box = font.getbbox(text)
+            return (box[2] - box[0], box[3] - box[1])
+        except Exception:
+            return (len(text) * 6, 10)
+
+
+def draw_annotations(img_bytes: bytes, boxes: List[Dict[str, Any]]) -> bytes:
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+    W, H = img.size
+    draw = ImageDraw.Draw(img)
+
+    # default font (safe)
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    # monochrome look: white strokes on semi-transparent black fill
+    for i, b in enumerate(boxes[:20], start=1):
+        try:
+            x1 = int(clamp01(float(b.get("x1", 0))) * W)
+            y1 = int(clamp01(float(b.get("y1", 0))) * H)
+            x2 = int(clamp01(float(b.get("x2", 0))) * W)
+            y2 = int(clamp01(float(b.get("y2", 0))) * H)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            label = str(b.get("label") or f"#{i}")[:24]
+
+            # translucent fill
+            draw.rectangle([x1, y1, x2, y2], outline=(255, 255, 255, 255), width=3)
+            draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0, 30))
+
+            # label
+            if font:
+                tw, th = _text_bbox(draw, label, font)
+                pad = 4
+                lx1, ly1 = x1, max(0, y1 - th - pad * 2)
+                lx2, ly2 = x1 + tw + pad * 2, ly1 + th + pad * 2
+                draw.rectangle([lx1, ly1, lx2, ly2], fill=(0, 0, 0, 200))
+                draw.text((lx1 + pad, ly1 + pad), label, font=font, fill=(255, 255, 255, 255))
         except Exception:
             continue
-    return ImageFont.load_default()
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
 
 
-def text_size(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
-    bbox = draw.textbbox((0, 0), text, font=font)
-    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+def compute_ascii_width_for_mobile(img_bytes: bytes) -> int:
+    # conservative width to avoid wrapping in Telegram on phones
+    # (monospace code block still wraps if too wide)
+    # 32–38 is usually safe; pick 34 as a good default
+    return 34
 
 
-def draw_annotations(image_bytes: bytes, boxes: List[Dict[str, Any]]) -> bytes:
-    im = Image.open(BytesIO(image_bytes)).convert("RGBA")
-    w, h = im.size
-    overlay = Image.new("RGBA", im.size, (0, 0, 0, 0))
-    d = ImageDraw.Draw(overlay)
-
-    font = pick_font(14)
-
-    for i, b in enumerate(boxes, start=1):
-        x1 = int(b["x1"] * w)
-        y1 = int(b["y1"] * h)
-        x2 = int(b["x2"] * w)
-        y2 = int(b["y2"] * h)
-        label = f"{i}. {b['label']}"
-
-        d.rectangle([x1 + 2, y1 + 2, x2 + 2, y2 + 2], outline=(0, 0, 0, 180), width=4)
-        d.rectangle([x1, y1, x2, y2], outline=(255, 255, 255, 240), width=3)
-
-        tw, th = text_size(d, label, font)
-        pad = 6
-        bx1, by1 = x1, max(0, y1 - (th + pad * 2))
-        bx2, by2 = x1 + tw + pad * 2, y1
-        d.rectangle([bx1, by1, bx2, by2], fill=(0, 0, 0, 200))
-        d.text((bx1 + pad, by1 + pad), label, font=font, fill=(255, 255, 255, 255))
-
-    out = Image.alpha_composite(im, overlay).convert("RGB")
-    buf = BytesIO()
-    out.save(buf, format="PNG")
-    return buf.getvalue()
+def enforce_ascii_lines(lines: List[str], width: int, height: int) -> List[str]:
+    # truncate/pad each line to exact width and exact height
+    fixed = []
+    for ln in (lines or []):
+        ln = ln.replace("\t", " ")
+        if len(ln) > width:
+            ln = ln[:width]
+        fixed.append(ln.ljust(width))
+        if len(fixed) >= height:
+            break
+    while len(fixed) < height:
+        fixed.append(" " * width)
+    return fixed
 
 
-# =========================
+# ----------------------------
+# OpenAI / LLM
+# ----------------------------
+
+def img_to_data_uri_png(img_bytes: bytes) -> str:
+    # ensure PNG to keep things consistent
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    b64 = base64.b64encode(out.getvalue()).decode("utf-8")
+    return "data:image/png;base64," + b64
+
+
+def parse_json_safe(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    # try to extract JSON object from text
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    chunk = text[start : end + 1]
+    try:
+        return json.loads(chunk)
+    except Exception:
+        return None
+
+
+def llm_request(prompt_text: str, data_uri: str) -> str:
+    if not client:
+        raise RuntimeError("No OpenAI client")
+
+    resp = client.responses.create(
+        model=LLM_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt_text},
+                    {"type": "input_image", "image_url": data_uri},
+                ],
+            }
+        ],
+    )
+
+    # unify different sdk shapes
+    try:
+        return resp.output_text or ""
+    except Exception:
+        try:
+            return resp.output[0].content[0].text  # type: ignore
+        except Exception:
+            return ""
+
+
+async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional[Dict[str, Any]]:
+    if not client:
+        return {"error": "no_llm"}
+
+    language = lang_for(uid)
+    data_uri = img_to_data_uri_png(img_bytes)
+
+    # Keep output strictly JSON to avoid Telegram HTML parsing crashes
+    prompt = f"""
+You are a tough-but-fair senior product designer doing a design review.
+
+Return ONLY valid JSON. No markdown. No extra keys.
+
+Language: "{language}" ("en" or "ru").
+Be honest, no profanity.
+
+Tasks:
+1) Describe what you see on the screenshot (short, concrete).
+2) Give verdict + recommendations (mix UI/UX + text, actionable).
+   - Guess font family vibe only (e.g., "Inter-like / SF Pro-like / Roboto-like"), no exact sizes, no hex colors.
+   - If something is good, praise it and say what exactly is good.
+3) Provide a score from 1 to 10 (integer).
+4) Provide up to 12 annotation boxes for major issues or key elements.
+   - Coordinates are RELATIVE 0..1: x1,y1,x2,y2
+   - label should be short (max 24 chars), in the chosen language
+5) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} characters per line.
+   - Provide as an array of strings (ascii_concept).
+   - Each line MUST be <= {ascii_w} chars.
+   - Use simple box-drawing / ASCII, make it feel like a wireframe.
+
+JSON schema:
+{{
+  "language": "{language}",
+  "score_10": 7,
+  "what_i_see": "...",
+  "verdict": "...",
+  "boxes": [{{"x1":0.1,"y1":0.2,"x2":0.4,"y2":0.3,"label":"..."}}],
+  "ascii_width": {ascii_w},
+  "ascii_height": 18,
+  "ascii_concept": ["..."]
+}}
+""".strip()
+
+    # run sync openai call in a thread so Cancel can interrupt
+    try:
+        text = await asyncio.to_thread(llm_request, prompt, data_uri)
+        data = parse_json_safe(text)
+        if not data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+# ----------------------------
 # Review pipeline
-# =========================
-async def do_review(message: Message, bot: Bot, img_bytes: bytes, user_id: int):
-    CANCEL_FLAGS[user_id] = False
+# ----------------------------
+
+async def send_channel(uid: int, m: Message) -> None:
+    lang = lang_for(uid)
+    text = f"{t(uid,'channel_msg')} @prodooktovy"
+    await m.answer(escape_html(text), reply_markup=channel_inline_kb())
+
+
+async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> None:
+    # mark running
+    CANCEL_FLAGS[uid] = False
+
+    # 1) progress spinner while LLM runs
+    done = asyncio.Event()
+    spinner_task = asyncio.create_task(
+        animate_progress_until_done(
+            message,
+            uid,
+            title=t(uid, "progress_title"),
+            done_event=done,
+            tick=0.12,
+        )
+    )
 
     try:
-        await animate_progress(
-            message,
-            user_id,
-            title=("Review in progress" if lang_for(user_id) == "en" else "Ревью в процессе"),
-            seconds=1.8,
-        )
-
-        if CANCEL_FLAGS.get(user_id):
-            await message.answer(escape_html(t(user_id, "cancelled")), reply_markup=main_menu_kb(user_id))
+        if not client:
+            done.set()
+            await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
             return
 
-        ascii_w, ascii_h = compute_ascii_dims(img_bytes)
+        ascii_w = compute_ascii_width_for_mobile(img_bytes)
 
-        # LLM in thread => Cancel works
-        result = await llm_review_image(img_bytes, user_id, ascii_w, ascii_h)
+        result = await llm_review_image(img_bytes, uid, ascii_w)
 
-        if CANCEL_FLAGS.get(user_id):
-            await message.answer(escape_html(t(user_id, "cancelled")), reply_markup=main_menu_kb(user_id))
+        # stop spinner
+        done.set()
+        try:
+            await spinner_task
+        except Exception:
+            pass
+
+        if CANCEL_FLAGS.get(uid):
+            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
         if not result:
-            await message.answer(escape_html(t(user_id, "llm_fail")), reply_markup=main_menu_kb(user_id))
+            await message.answer(escape_html(t(uid, "llm_fail")), reply_markup=main_menu_kb(uid))
             return
 
-        # force language match
-        if result.get("language") != lang_for(user_id):
-            result["language"] = lang_for(user_id)
+        if result.get("error") == "no_llm":
+            await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
+            return
+
+        # enforce language in text output
+        result["language"] = lang_for(uid)
+
+        score = result.get("score_10", None)
+        try:
+            score_int = int(score)
+        except Exception:
+            score_int = 0
+        score_int = max(1, min(10, score_int))
 
         # 1) What I see
-        score_line = f"{t(user_id,'score')}: {int(result['score_10'])}/10"
-        what_text = f"<b>{escape_html(t(user_id,'whatisee'))}</b>\n{escape_html(result['what_i_see'])}\n\n<b>{escape_html(score_line)}</b>"
-        await message.answer(what_text)
+        msg1 = (
+            f"<b>{escape_html(t(uid,'whatisee'))}</b>\n"
+            f"{escape_html(str(result.get('what_i_see','')).strip())}\n\n"
+            f"<b>{escape_html(t(uid,'score'))}: {score_int}/10</b>"
+        )
+        await message.answer(msg1)
 
-        if CANCEL_FLAGS.get(user_id):
-            await message.answer(escape_html(t(user_id, "cancelled")), reply_markup=main_menu_kb(user_id))
+        if CANCEL_FLAGS.get(uid):
+            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
-        # 2) Verdict
-        verdict_text = f"<b>{escape_html(t(user_id,'verdict'))}</b>\n{escape_html(result['verdict'])}"
-        await message.answer(verdict_text)
+        # 2) Verdict + recommendations
+        msg2 = f"<b>{escape_html(t(uid,'verdict'))}</b>\n{escape_html(str(result.get('verdict','')).strip())}"
+        await message.answer(msg2)
 
-        if CANCEL_FLAGS.get(user_id):
-            await message.answer(escape_html(t(user_id, "cancelled")), reply_markup=main_menu_kb(user_id))
+        if CANCEL_FLAGS.get(uid):
+            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
         # 3) Annotated screenshot
-        boxes = result.get("boxes", [])
-        if boxes:
+        boxes = result.get("boxes") or []
+        if isinstance(boxes, list) and boxes:
             try:
                 annotated_bytes = draw_annotations(img_bytes, boxes)
-                cap = f"{t(user_id,'annotated')}: {len(boxes)}"
+                cap = f"{t(uid,'annotated')}"
                 photo = BufferedInputFile(annotated_bytes, filename="annotated.png")
                 await message.answer_photo(photo=photo, caption=escape_html(cap))
             except Exception:
+                # if annotation fails, do not break the whole flow
                 pass
 
-        if CANCEL_FLAGS.get(user_id):
-            await message.answer(escape_html(t(user_id, "cancelled")), reply_markup=main_menu_kb(user_id))
+        if CANCEL_FLAGS.get(uid):
+            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
-        await animate_progress(
-            message,
-            user_id,
-            title=("Drafting wireframe" if lang_for(user_id) == "en" else "Собираю wireframe"),
-            seconds=1.5,
+        # 4) ASCII wireframe concept
+        # small second spinner for wireframe (quick)
+        done2 = asyncio.Event()
+        spinner2 = asyncio.create_task(
+            animate_progress_until_done(
+                message,
+                uid,
+                title=t(uid, "progress_wire"),
+                done_event=done2,
+                tick=0.12,
+            )
         )
 
-        # 4) ASCII wireframe (monospace, width-limited)
-        width = int(result.get("ascii_width", ascii_w))
-        height = int(result.get("ascii_height", ascii_h))
-        lines = enforce_boxed(result.get("ascii_concept", []), width, height)
-        concept_block = "\n".join(lines)
+        try:
+            width = int(result.get("ascii_width") or ascii_w)
+            height = int(result.get("ascii_height") or 18)
+            width = max(26, min(42, width))   # keep it phone-safe
+            height = max(12, min(26, height)) # not too tall
+            lines = result.get("ascii_concept") or []
+            if not isinstance(lines, list):
+                lines = []
+            fixed = enforce_ascii_lines([str(x) for x in lines], width=width, height=height)
+            concept_block = "\n".join(fixed)
+        finally:
+            done2.set()
+            try:
+                await spinner2
+            except Exception:
+                pass
 
-        concept_msg = f"<b>{escape_html(t(user_id,'concept'))}</b>\n<code>{escape_html(concept_block)}</code>"
-        await message.answer(concept_msg)
+        msg4 = f"<b>{escape_html(t(uid,'concept'))}</b>\n<code>{escape_html(concept_block)}</code>"
+        await message.answer(msg4)
 
-        # menu at the end only
-        await message.answer(escape_html(t(user_id, "need_input")), reply_markup=main_menu_kb(user_id))
+        # menu at the end
+        await message.answer(escape_html(t(uid, "need_input")), reply_markup=main_menu_kb(uid))
 
-    except asyncio.CancelledError:
-        # hard-cancel path
-        CANCEL_FLAGS[user_id] = True
-        await message.answer(escape_html(t(user_id, "cancelled")), reply_markup=main_menu_kb(user_id))
-        raise
-
-
-async def start_review_from_image(message: Message, bot: Bot, img_bytes: bytes):
-    user_id = message.from_user.id
-
-    if user_id in RUNNING_TASKS and not RUNNING_TASKS[user_id].done():
-        await message.answer(escape_html(t(user_id, "busy")))
-        return
-
-    task = asyncio.create_task(do_review(message, bot, img_bytes, user_id))
-    RUNNING_TASKS[user_id] = task
-    try:
-        await task
     finally:
-        RUNNING_TASKS.pop(user_id, None)
-        CANCEL_FLAGS[user_id] = False
+        done.set()
+        if not spinner_task.done():
+            spinner_task.cancel()
 
 
-async def start_review_from_figma_link(message: Message, bot: Bot, figma_url: str):
-    user_id = message.from_user.id
+# ----------------------------
+# Telegram handlers
+# ----------------------------
 
-    if user_id in RUNNING_TASKS and not RUNNING_TASKS[user_id].done():
-        await message.answer(escape_html(t(user_id, "busy")))
-        return
-
-    await animate_progress(
-        message,
-        user_id,
-        title=("Fetching Figma preview" if lang_for(user_id) == "en" else "Тащу превью из Figma"),
-        seconds=1.4,
-    )
-
-    img = await figma_preview_image(figma_url)
-    if not img:
-        await message.answer(
-            escape_html(
-                ("Couldn't fetch Figma preview. Make sure the file is public." if lang_for(user_id) == "en"
-                 else "Не смог скачать превью. Проверь, что файл публичный.")
-            ),
-            reply_markup=main_menu_kb(user_id),
-        )
-        return
-
-    # show preview
-    try:
-        photo = BufferedInputFile(img, filename="figma_preview.png")
-        await message.answer_photo(photo=photo, caption=escape_html("Figma preview" if lang_for(user_id) == "en" else "Превью Figma"))
-    except Exception:
-        pass
-
-    await start_review_from_image(message, bot, img)
+router = Router()
 
 
-# =========================
-# Handlers
-# =========================
-@router.message(CommandStart())
-async def on_start(m: Message):
-    user_id = m.from_user.id
-    if user_id not in USER_LANG:
-        USER_LANG[user_id] = "en"
-    title = STR[lang_for(user_id)]["hello_title"]
-    body = STR[lang_for(user_id)]["hello_body"]
-    await m.answer(f"<b>{escape_html(title)}</b>\n\n{escape_html(body)}", reply_markup=main_menu_kb(user_id))
-
-
-@router.callback_query(F.data == "how")
-async def on_how(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    await cb.answer()
-    await cb.message.answer(escape_html(STR[lang_for(user_id)]["how"]), reply_markup=main_menu_kb(user_id))
-
-
-@router.callback_query(F.data == "review")
-async def on_review_btn(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    await cb.answer()
-    await cb.message.answer(escape_html(t(user_id, "need_input")))
-
-
-@router.callback_query(F.data == "toggle_lang")
-async def on_toggle_lang(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    USER_LANG[user_id] = "ru" if lang_for(user_id) == "en" else "en"
-    await cb.answer("OK")
-    try:
-        await cb.message.edit_reply_markup(reply_markup=main_menu_kb(user_id))
-    except Exception:
-        await cb.message.answer("OK", reply_markup=main_menu_kb(user_id))
-
-
-@router.callback_query(F.data == "cancel")
+@router.callback_query(F.data.startswith("cancel:"))
 async def on_cancel(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    CANCEL_FLAGS[user_id] = True
+    try:
+        uid = cb.from_user.id
+    except Exception:
+        return
 
-    # hard-cancel running task
-    task = RUNNING_TASKS.get(user_id)
+    CANCEL_FLAGS[uid] = True
+
+    # cancel running task if exists
+    task = RUNNING_TASK.get(uid)
     if task and not task.done():
         task.cancel()
 
-    await cb.answer("Cancelled" if lang_for(user_id) == "en" else "Отменено")
-    await cb.message.answer(escape_html(t(user_id, "cancelled")), reply_markup=main_menu_kb(user_id))
+    try:
+        await cb.answer("OK", show_alert=False)
+    except Exception:
+        pass
+
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+@router.message(CommandStart())
+async def on_start(m: Message):
+    uid = m.from_user.id
+    if uid not in LANG:
+        set_lang(uid, "en")
+
+    await m.answer(
+        escape_html(t(uid, "start")),
+        reply_markup=main_menu_kb(uid),
+    )
 
 
 @router.message(F.text)
 async def on_text(m: Message, bot: Bot):
-    user_id = m.from_user.id
-    figma_url = extract_figma_url(m.text or "")
-    if figma_url:
-        await start_review_from_figma_link(m, bot, figma_url)
+    uid = m.from_user.id
+    txt = (m.text or "").strip()
+
+    # menu actions
+    if txt == t(uid, "menu_how"):
+        await m.answer(escape_html(t(uid, "how")), reply_markup=main_menu_kb(uid))
         return
-    await m.answer(escape_html(t(user_id, "need_input")))
 
-
-@router.message(F.photo | F.document)
-async def on_image(m: Message, bot: Bot):
-    user_id = m.from_user.id
-    if not is_image_message(m):
-        await m.answer(escape_html(t(user_id, "need_input")))
+    if txt == t(uid, "menu_lang"):
+        # toggle
+        new_lang = "ru" if lang_for(uid) == "en" else "en"
+        set_lang(uid, new_lang)
+        await m.answer(escape_html(t(uid, "start")), reply_markup=main_menu_kb(uid))
         return
-    img_bytes = await download_tg_image_bytes(m, bot)
-    if not img_bytes:
-        await m.answer(escape_html(t(user_id, "llm_fail")), reply_markup=main_menu_kb(user_id))
+
+    if txt == t(uid, "menu_channel"):
+        await send_channel(uid, m)
         return
-    await start_review_from_image(m, bot, img_bytes)
+
+    if txt == t(uid, "menu_submit"):
+        await m.answer(escape_html(t(uid, "need_input")))
+        return
+
+    # figma link
+    if is_figma_link(txt):
+        if RUNNING_TASK.get(uid) and not RUNNING_TASK[uid].done():
+            await m.answer(escape_html(t(uid, "busy")))
+            return
+
+        thumb = fetch_figma_thumbnail(txt)
+        if not thumb:
+            await m.answer(escape_html(t(uid, "figma_fetch_fail")), reply_markup=main_menu_kb(uid))
+            return
+
+        # show preview image first (optional)
+        try:
+            photo = BufferedInputFile(thumb, filename="figma_preview.png")
+            await m.answer_photo(photo=photo, caption=escape_html(t(uid, "preview")))
+        except Exception:
+            pass
+
+        async def _run():
+            await do_review(m, bot, thumb, uid)
+
+        task = asyncio.create_task(_run())
+        RUNNING_TASK[uid] = task
+        return
+
+    # otherwise
+    await m.answer(escape_html(t(uid, "not_image")), reply_markup=main_menu_kb(uid))
 
 
-# =========================
-# Main
-# =========================
+@router.message(F.photo)
+async def on_photo(m: Message, bot: Bot):
+    uid = m.from_user.id
+
+    if RUNNING_TASK.get(uid) and not RUNNING_TASK[uid].done():
+        await m.answer(escape_html(t(uid, "busy")))
+        return
+
+    # download best size
+    photo = m.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    img_bytes = await bot.download_file(file.file_path)
+    data = img_bytes.read() if hasattr(img_bytes, "read") else bytes(img_bytes)
+
+    async def _run():
+        await do_review(m, bot, data, uid)
+
+    task = asyncio.create_task(_run())
+    RUNNING_TASK[uid] = task
+
+
+# ----------------------------
+# App entry
+# ----------------------------
+
 async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
     bot = Bot(
-        token=BOT_TOKEN,
+        BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
     await dp.start_polling(bot)
 
 
