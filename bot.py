@@ -1,10 +1,6 @@
 # bot.py
 # Telegram UI/UX + Copy design-review buddy
-# - accepts screenshots (images) and public Figma frame links (oEmbed preview)
-# - outputs: (1) description (2) verdict+recs (3) annotated image (4) concept image
-# - dynamic retro ASCII progress
-# - annotations: pins + glow (more informative even with approximate bboxes)
-# - no dotenv dependency
+# Fix: HTML parse errors in ASCII animations (escape + no < >)
 
 import asyncio
 import base64
@@ -15,6 +11,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+import html as py_html
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -41,19 +38,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
-# Concept image generation toggle
 CONCEPT_ENABLED = os.getenv("CONCEPT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
-
-# Image generation model
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1").strip()
 
 MAX_PREVIEW_BYTES = int(os.getenv("MAX_PREVIEW_BYTES", "8000000"))  # 8 MB
 
-# Progress tuning (more dynamic)
 PROGRESS_TOTAL_FRAMES = int(os.getenv("PROGRESS_TOTAL_FRAMES", "28"))
 PROGRESS_DELAY = float(os.getenv("PROGRESS_DELAY", "0.12"))
 
-# If empty -> fail fast
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in environment variables (Railway Variables or local env).")
 if not OPENAI_API_KEY:
@@ -115,55 +107,58 @@ async def safe_edit_or_resend(msg: Message, text: str, parse_mode: Optional[str]
             return msg
 
 
+def html_escape(s: str) -> str:
+    return py_html.escape(s, quote=False)
+
+
 # ----------------------------
 # Retro ASCII animation (dynamic)
 # ----------------------------
 _SPIN = ["|", "/", "-", "\\"]
 _TAPE = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 def _ascii_frame(t: int, total: int, title: str) -> str:
-    # progress 0..1
     p = max(0.0, min(1.0, t / max(1, total)))
     bar_w = 26
     filled = int(p * bar_w)
 
-    # pulse char
     pulse = "@" if (t % 6 in (0, 1)) else "#"
-
     bar = "[" + (pulse * filled) + ("." * (bar_w - filled)) + "]"
     spin = _SPIN[t % len(_SPIN)]
 
-    # scanline moves down
     box_h = 6
     scan_y = t % box_h
 
-    # ticker scroll
     scroll = t % len(_TAPE)
     ticker = (_TAPE[scroll:] + _TAPE[:scroll])[:22]
 
-    # small "CRT box"
     lines = []
     for y in range(box_h):
         if y == scan_y:
             lines.append("|" + ("=" * 28) + "|")
         else:
-            # tiny noise pattern
             noise = "".join(["." if ((x + t + y) % 9) else ":" for x in range(28)])
             lines.append("|" + noise + "|")
 
     pct = int(p * 100)
     header = f"{title} {spin}  {pct:02d}%"
-    footer = f"{bar}  <{ticker}>"
+    # IMPORTANT: no < > here (Telegram HTML parse mode)
+    footer = f"{bar}  [{ticker}]"
     return header + "\n" + "\n".join(lines) + "\n" + footer
 
 
 async def animate_progress(anchor: Message, title: str = "Processing") -> Message:
+    frame0 = f"{title}\n{_ascii_frame(0, PROGRESS_TOTAL_FRAMES, title)}"
     msg = await anchor.answer(
-        f"{title}\n<code>{_ascii_frame(0, PROGRESS_TOTAL_FRAMES, title)}</code>",
+        f"{html_escape(title)}\n<code>{html_escape(_ascii_frame(0, PROGRESS_TOTAL_FRAMES, title))}</code>",
         parse_mode=ParseMode.HTML
     )
     for i in range(1, PROGRESS_TOTAL_FRAMES + 1):
-        frame = f"{title}\n<code>{_ascii_frame(i, PROGRESS_TOTAL_FRAMES, title)}</code>"
-        msg = await safe_edit_or_resend(msg, frame, parse_mode=ParseMode.HTML)
+        frame = f"{title}\n{_ascii_frame(i, PROGRESS_TOTAL_FRAMES, title)}"
+        msg = await safe_edit_or_resend(
+            msg,
+            f"{html_escape(title)}\n<code>{html_escape(_ascii_frame(i, PROGRESS_TOTAL_FRAMES, title))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
         await asyncio.sleep(PROGRESS_DELAY)
     return msg
 
@@ -180,7 +175,6 @@ def extract_figma_url(text: str) -> Optional[str]:
     return m.group(1).strip()
 
 def figma_oembed_url(figma_url: str) -> str:
-    # cache-buster
     bust = int(time.time() * 1000)
     return "https://www.figma.com/oembed?url=" + urllib.parse.quote(figma_url, safe="") + f"&_cb={bust}"
 
@@ -249,7 +243,6 @@ REVIEW_SCHEMA: Dict[str, Any] = {
             },
         },
 
-        # More reliable: include center point too
         "annotations": {
             "type": "array",
             "items": {
@@ -262,10 +255,7 @@ REVIEW_SCHEMA: Dict[str, Any] = {
                     "center": {
                         "type": "object",
                         "additionalProperties": False,
-                        "properties": {
-                            "x": {"type": "number", "minimum": 0, "maximum": 1},
-                            "y": {"type": "number", "minimum": 0, "maximum": 1},
-                        },
+                        "properties": {"x": {"type": "number", "minimum": 0, "maximum": 1}, "y": {"type": "number", "minimum": 0, "maximum": 1}},
                         "required": ["x", "y"],
                     },
                     "bbox": {
@@ -319,16 +309,14 @@ TASK_PROMPT = (
     "- Аннотации ставь ТОЛЬКО на реальные элементы (текст/кнопка/поле/лейбл/сообщение). НЕ на пустые зоны.\n"
     "- Если не уверен в роли текста — role_guess='unknown'.\n"
     "- bbox и center должны быть согласованны: center внутри bbox.\n"
-    "- Если не уверен в точных координатах — лучше уменьшить число аннотаций, но сделать их релевантными.\n"
+    "- Если не уверен в точных координатах — лучше меньше аннотаций, но релевантных.\n"
 )
-
 
 def _b64_png_from_bytes(img_bytes: bytes) -> str:
     im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
-
 
 def call_llm_review(img_bytes: bytes) -> Dict[str, Any]:
     img_b64 = _b64_png_from_bytes(img_bytes)
@@ -355,9 +343,7 @@ def call_llm_review(img_bytes: bytes) -> Dict[str, Any]:
         },
     )
 
-    raw = getattr(resp, "output_text", None) or ""
-    raw = raw.strip()
-
+    raw = (getattr(resp, "output_text", "") or "").strip()
     try:
         return json.loads(raw)
     except Exception:
@@ -388,7 +374,6 @@ def draw_annotations(img_bytes: bytes, ann: List[Dict[str, Any]]) -> bytes:
     except Exception:
         font = None
 
-    # helper: expand bbox a bit (helps when model is slightly off)
     def expand_box(x, y, bw, bh, pad=0.02):
         px = int(pad * w)
         py = int(pad * h)
@@ -398,15 +383,13 @@ def draw_annotations(img_bytes: bytes, ann: List[Dict[str, Any]]) -> bytes:
         y2 = min(h, y + bh + py)
         return x1, y1, x2, y2
 
-    # monochrome palette for overlay
-    glow_fill = (255, 255, 255, 35)    # soft white glow
+    glow_fill = (255, 255, 255, 35)
     glow_outline = (255, 255, 255, 120)
     pin_fill = (0, 0, 0, 255)
     pin_outline = (255, 255, 255, 255)
     text_bg = (0, 0, 0, 255)
     text_fg = (255, 255, 255, 255)
 
-    # Draw limited annotations to avoid mess
     for a in (ann or [])[:40]:
         if not isinstance(a, dict):
             continue
@@ -423,7 +406,6 @@ def draw_annotations(img_bytes: bytes, ann: List[Dict[str, Any]]) -> bytes:
         cy = int(clamp01(float(center.get("y", 0))) * h)
 
         if bw < 6 or bh < 6:
-            # If bbox is junk, still place a pin (more useful than wrong rectangle)
             bw = int(0.08 * w)
             bh = int(0.05 * h)
             bx = max(0, cx - bw // 2)
@@ -435,17 +417,14 @@ def draw_annotations(img_bytes: bytes, ann: List[Dict[str, Any]]) -> bytes:
         sev = str(a.get("severity", "low"))
         label = (str(a.get("label", "")).strip() or "Check")
 
-        # glow area (more informative than strict frame)
         draw.rectangle([x1, y1, x2, y2], fill=glow_fill, outline=glow_outline, width=2)
 
-        # pin / crosshair at center
         r = 8
         draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=pin_fill, outline=pin_outline, width=2)
         draw.line([cx - 14, cy, cx + 14, cy], fill=pin_outline, width=1)
         draw.line([cx, cy - 14, cx, cy + 14], fill=pin_outline, width=1)
 
         tag = f"{n}{sev_tag(sev)}"
-        # small label box near pin
         tx = min(w - 220, max(0, cx + 14))
         ty = min(h - 16, max(0, cy - 12))
         draw.rectangle([tx, ty, tx + 220, ty + 16], fill=text_bg)
@@ -461,9 +440,6 @@ def draw_annotations(img_bytes: bytes, ann: List[Dict[str, Any]]) -> bytes:
 # ----------------------------
 # Formatting
 # ----------------------------
-def fmt_score_line(name: str, score: int) -> str:
-    return f"{name}: {score}/10"
-
 def bullet(lines: List[str], limit: int = 8) -> str:
     out = []
     for s in lines[:limit]:
@@ -471,14 +447,6 @@ def bullet(lines: List[str], limit: int = 8) -> str:
         if s:
             out.append(f"- {s}")
     return "\n".join(out) if out else "- (нет)"
-
-def fmt_issue_block(title: str, why: str, how: str, sev: str) -> str:
-    st = {"high": "[!]", "medium": "[~]", "low": "[.]"}[sev]
-    return (
-        f"{st} {title}\n"
-        f"  Что не так: {why}\n"
-        f"  Как улучшить: {how}"
-    )
 
 def build_verdict(review: Dict[str, Any]) -> str:
     overall = int(review.get("overall_score", 5))
@@ -503,9 +471,9 @@ def build_verdict(review: Dict[str, Any]) -> str:
 
     lines = []
     lines.append("Вердикт")
-    lines.append(fmt_score_line("Общая оценка", overall))
-    lines.append(fmt_score_line("Визуал", vscore))
-    lines.append(fmt_score_line("Текст", cscore))
+    lines.append(f"Общая оценка: {overall}/10")
+    lines.append(f"Визуал: {vscore}/10")
+    lines.append(f"Текст: {cscore}/10")
     lines.append("")
 
     if font_guess or palette_guess:
@@ -527,15 +495,17 @@ def build_verdict(review: Dict[str, Any]) -> str:
         lines.append("")
 
     lines.append("Что чинить в первую очередь:")
+
     if vis_issues:
         lines.append("Визуал:")
         for i in vis_issues[:4]:
-            lines.append(fmt_issue_block(
-                str(i.get("title", "")).strip() or "Проблема",
-                str(i.get("why_bad", "")).strip() or "—",
-                str(i.get("how_to_fix", "")).strip() or "—",
-                str(i.get("severity", "low")),
-            ))
+            sev = str(i.get("severity", "low"))
+            st = {"high": "[!]", "medium": "[~]", "low": "[.]"}[sev]
+            lines.append(
+                f"{st} {str(i.get('title','')).strip() or 'Проблема'}\n"
+                f"  Что не так: {str(i.get('why_bad','')).strip() or '—'}\n"
+                f"  Как улучшить: {str(i.get('how_to_fix','')).strip() or '—'}"
+            )
     else:
         lines.append("Визуал:\n- (нет)")
 
@@ -558,9 +528,9 @@ def build_verdict(review: Dict[str, Any]) -> str:
 
 
 # ----------------------------
-# Concept generation (fix: request b64_json explicitly)
+# Concept generation
 # ----------------------------
-def generate_concept_image(review: Dict[str, Any], base_img_bytes: bytes) -> Optional[bytes]:
+def generate_concept_image(review: Dict[str, Any]) -> Optional[bytes]:
     if not CONCEPT_ENABLED:
         return None
 
@@ -568,34 +538,27 @@ def generate_concept_image(review: Dict[str, Any], base_img_bytes: bytes) -> Opt
     visual_issues = review.get("visual_issues") or []
     copy_issues = review.get("copy_issues") or []
 
-    top_visual = "; ".join([i.get("title","") for i in visual_issues[:5] if isinstance(i, dict)])
-    top_copy = "; ".join([i.get("title","") for i in copy_issues[:5] if isinstance(i, dict)])
+    top_visual = "; ".join([i.get("title", "") for i in visual_issues[:5] if isinstance(i, dict)])
+    top_copy = "; ".join([i.get("title", "") for i in copy_issues[:5] if isinstance(i, dict)])
 
     prompt = (
-        "Redesign concept of the same UI screen. "
+        "UI redesign concept of the same screen. "
         "Keep the same purpose and content, improve hierarchy, spacing, clarity, readability. "
         "Business UI, calm, no flashy decorations. "
         "Do not invent new features; refine layout and microcopy.\n"
-        f"Observed screen: {what}\n"
-        f"Fix these visual issues: {top_visual}\n"
-        f"Fix these copy issues: {top_copy}\n"
-        "Output should look like a UI screenshot concept."
+        f"Observed: {what}\n"
+        f"Fix visuals: {top_visual}\n"
+        f"Fix copy: {top_copy}\n"
+        "Output: a clean UI screenshot-like concept."
     )
 
-    # Important: response_format so we actually get base64
     res = client.images.generate(
         model=IMAGE_MODEL,
         prompt=prompt,
         size="1024x1024",
         response_format="b64_json",
     )
-
-    b64_out = None
-    try:
-        b64_out = res.data[0].b64_json
-    except Exception:
-        b64_out = None
-
+    b64_out = getattr(res.data[0], "b64_json", None)
     if not b64_out:
         return None
     return base64.b64decode(b64_out)
@@ -609,50 +572,37 @@ async def process_image_and_reply(msg: Message, img_bytes: bytes, source_note: O
 
     review = call_llm_review(img_bytes)
 
-    # 1) what i see
-    what = (review.get("what_i_see") or "").strip()
     if source_note:
         await msg.answer(source_note)
+
+    what = (review.get("what_i_see") or "").strip()
     await msg.answer(what if what else "(Не смог уверенно понять, что на экране)")
 
-    # 2) verdict
     await msg.answer(build_verdict(review))
 
-    # 3) annotated screenshot
     ann = review.get("annotations") or []
     try:
         annotated = draw_annotations(img_bytes, ann if isinstance(ann, list) else [])
         await msg.answer_photo(
             BufferedInputFile(annotated, filename="annotations.png"),
-            caption="Аннотации (метки: номер + короткий label)",
+            caption="Аннотации (метки: номер + label)",
         )
     except Exception:
-        await msg.answer("Аннотации не нарисовал: что-то сломалось на этапе разметки картинки.")
+        await msg.answer("Аннотации не нарисовал: сломалось на этапе разметки картинки.")
 
-    # 4) concept
     if CONCEPT_ENABLED:
         await animate_progress(msg, title="Concept build")
-
-        concept = None
-        err = None
         try:
-            concept = generate_concept_image(review, img_bytes)
-        except Exception as e:
-            err = str(e)
-            concept = None
-
-        if concept:
-            await msg.answer_photo(
-                BufferedInputFile(concept, filename="concept.png"),
-                caption="Концепт (черновик направления, без финальной полировки)",
-            )
-        else:
-            # Clear, non-technical-ish but still helpful
-            note = "Концепт сейчас не сгенерировался."
-            if err:
-                # keep it short, no raw dumps
-                note += " Похоже, сервис генерации изображений недоступен для текущего окружения/ключа."
-            await msg.answer(note)
+            concept = generate_concept_image(review)
+            if concept:
+                await msg.answer_photo(
+                    BufferedInputFile(concept, filename="concept.png"),
+                    caption="Концепт (черновик направления, без финальной полировки)",
+                )
+            else:
+                await msg.answer("Концепт сейчас не сгенерировался.")
+        except Exception:
+            await msg.answer("Концепт сейчас не сгенерировался (сервис генерации недоступен).")
 
 
 # ----------------------------
@@ -707,15 +657,11 @@ async def on_text(m: Message):
         preview_bytes, caption = fetch_figma_preview(url)
         await m.answer_photo(BufferedInputFile(preview_bytes, filename="figma_preview.png"), caption=caption)
 
-        note = (
-            "Источник: Figma превью.\n"
-            "Если Figma отдаёт одинаковое превью на весь файл — разные node-id могут выглядеть одинаково."
-        )
+        note = "Источник: Figma превью."
         await process_image_and_reply(m, preview_bytes, source_note=note)
-    except Exception as e:
+    except Exception:
         await m.answer(
-            "Не смог скачать превью из Figma.\n"
-            "Проверь, что файл публичный, и попробуй ещё раз.",
+            "Не смог скачать превью из Figma.\nПроверь, что файл публичный, и попробуй ещё раз.",
             reply_markup=main_menu(),
         )
 
