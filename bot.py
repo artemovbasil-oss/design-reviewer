@@ -1,235 +1,202 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Design Reviewer Bot (Telegram)
-
-Flow (per screenshot / public Figma frame link):
-1) Text: what I see
-2) Text: verdict + recommendations (UX + copy) + score /10
-3) Image: annotated screenshot (boxes/arrows/labels)
-4) ASCII retro progress animation
-5) Image: concept draft (resized to original screenshot size)
-
-Notes:
-- Emojis: mostly monochrome/neutral
-- No technical measurements (no exact font sizes / color values). Font family guesses only.
-- Avoids leaking JSON/arrays in user-facing messages.
-- Figma link support uses Figma oEmbed thumbnail (works only if file is public).
-"""
+# bot.py
+# Telegram UI/UX + Copy design-review buddy
+# - accepts screenshots (images) and public Figma frame links (oEmbed preview)
+# - outputs: (1) description (2) verdict+recs (3) annotated image (4) concept image
+# - retro ASCII progress
+# - no dotenv dependency
 
 import asyncio
 import base64
-import hashlib
+import io
 import json
 import os
 import re
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from io import BytesIO
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import html as pyhtml
 
-import httpx
-from dotenv import load_dotenv
-from PIL import Image, ImageDraw, ImageFont
-
-import pytesseract
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ContentType
-from aiogram.filters import Command
 from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove,
 )
+
+from PIL import Image, ImageDraw, ImageFont
 
 from openai import OpenAI
 
 
-# -----------------------------
-# Env / Config
-# -----------------------------
-
-def load_env() -> None:
-    # Robust .env loading (works in scripts, REPL, containers)
-    env_path = Path(__file__).with_name(".env")
-    if env_path.exists():
-        load_dotenv(dotenv_path=str(env_path), override=False)
-    else:
-        load_dotenv(override=False)
-
-
-load_env()
-
+# ----------------------------
+# Config
+# ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-OCR_LANG = os.getenv("OCR_LANG", "rus+eng").strip()
-LLM_ENABLED = os.getenv("LLM_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
+# Model for vision+text
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
-# Optional: in macOS you might need to set this:
-# export TESSERACT_CMD="/opt/homebrew/bin/tesseract"
-TESSERACT_CMD = os.getenv("TESSERACT_CMD", "").strip()
-if TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+# Concept image generation (set to "true" to enable)
+CONCEPT_ENABLED = os.getenv("CONCEPT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "y")
 
+# Image generation model (per OpenAI docs; adjust if you use another)
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-image-1").strip()
+
+# Safety: max image bytes to download for figma preview
+MAX_PREVIEW_BYTES = int(os.getenv("MAX_PREVIEW_BYTES", "8000000"))  # 8 MB
+
+# Retro progress timing
+PROGRESS_STEPS = int(os.getenv("PROGRESS_STEPS", "10"))
+PROGRESS_DELAY = float(os.getenv("PROGRESS_DELAY", "0.20"))
+
+# If empty -> fail fast
 if not BOT_TOKEN:
-    raise RuntimeError("Set BOT_TOKEN in .env or environment")
-if LLM_ENABLED and not OPENAI_API_KEY:
-    raise RuntimeError("Set OPENAI_API_KEY in .env or environment if LLM_ENABLED=true")
+    raise RuntimeError("Set BOT_TOKEN in environment variables (Railway Variables or local env).")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Set OPENAI_API_KEY in environment variables (Railway Variables or local env).")
 
-client = OpenAI(api_key=OPENAI_API_KEY) if LLM_ENABLED else None
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+router = Router()
 
 
-# -----------------------------
-# UI (Keyboards)
-# -----------------------------
+# ----------------------------
+# UI: monochrome style
+# ----------------------------
+BTN_REVIEW = "review"
+BTN_HOW = "how"
+BTN_PING = "ping"
 
-BTN_SUBMIT = "Submit for review"
-BTN_HOW = "How does it work?"
-BTN_PING = "Ping"
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Закинуть на ревью", callback_data=BTN_REVIEW)],
+            [InlineKeyboardButton(text="Как это работает?", callback_data=BTN_HOW)],
+            [InlineKeyboardButton(text="Ping", callback_data=BTN_PING)],
+        ]
+    )
 
-MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_SUBMIT)],
-        [KeyboardButton(text=BTN_HOW), KeyboardButton(text=BTN_PING)],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Send a screenshot or a public Figma frame link…",
+WELCOME_TEXT = (
+    "Я — партнёр для дизайн-ревью.\n\n"
+    "Принимаю на разбор:\n"
+    "- скриншоты интерфейса (картинки)\n"
+    "- ссылки на Figma фреймы (если файл публичный)\n\n"
+    "Жми «Закинуть на ревью» или просто отправь скрин/ссылку."
 )
 
+HOW_TEXT = (
+    "Как это работает:\n"
+    "1) Отправь скриншот или ссылку на публичный Figma фрейм\n"
+    "2) Я покажу прогресс обработки\n"
+    "3) Верну:\n"
+    "   - что я вижу\n"
+    "   - вердикт и рекомендации (UX + текст) + оценка\n"
+    "   - аннотации на скрине\n"
+    "   - концепт, как могло бы быть"
+)
 
-# -----------------------------
-# ASCII retro progress
-# -----------------------------
-
-ASCII_FRAMES = [
-    r"""[=         ]""",
-    r"""[==        ]""",
-    r"""[===       ]""",
-    r"""[====      ]""",
-    r"""[=====     ]""",
-    r"""[======    ]""",
-    r"""[=======   ]""",
-    r"""[========  ]""",
-    r"""[========= ]""",
-    r"""[==========]""",
-]
-
-def ascii_line(i: int, label: str) -> str:
-    i = max(0, min(i, len(ASCII_FRAMES) - 1))
-    return f"{label}\n{ASCII_FRAMES[i]}"
-
-async def send_ascii_progress(chat_msg: Message, label: str, delay: float = 0.12) -> None:
-    # Do NOT edit messages (Telegram sometimes refuses edits).
-    # Instead send a short series of new messages.
-    for i in range(0, len(ASCII_FRAMES), 2):
-        await chat_msg.answer(f"<code>{pyhtml.escape(ascii_line(i, label))}</code>")
-        await asyncio.sleep(delay)
+PING_TEXT = "pong"
 
 
-# -----------------------------
-# Helpers: detect input type
-# -----------------------------
+# ----------------------------
+# Helpers: robust message edit
+# ----------------------------
+async def safe_edit_or_resend(msg: Message, text: str, parse_mode: Optional[str] = None) -> Message:
+    """
+    Telegram sometimes refuses editing ("message can't be edited").
+    This helper tries edit, otherwise sends a new message and returns it.
+    """
+    try:
+        await msg.edit_text(text, parse_mode=parse_mode)
+        return msg
+    except Exception:
+        # Fall back: send a new message
+        try:
+            return await msg.answer(text, parse_mode=parse_mode)
+        except Exception:
+            # As last resort, ignore
+            return msg
 
-FIGMA_URL_RE = re.compile(r"https?://www\.figma\.com/(design|file)/[^ ]+", re.IGNORECASE)
 
-def is_figma_url(text: str) -> bool:
-    return bool(FIGMA_URL_RE.search(text or ""))
+def ascii_bar(i: int, total: int) -> str:
+    # Retro, clean, no weird glyphs.
+    filled = int((i / total) * 20)
+    return "[" + "#" * filled + "-" * (20 - filled) + "]"
 
-def extract_node_id(url: str) -> Optional[str]:
-    # Accept node-id=1-2 or node-id=2%3A88 etc.
-    m = re.search(r"node-id=([^&]+)", url)
+
+async def animate_progress(anchor: Message, title: str = "Смотрю внимательно") -> Message:
+    """
+    Shows a short retro ASCII animation by editing one message.
+    Returns the last message used (might be re-sent if edit fails).
+    """
+    msg = await anchor.answer(f"{title}\n<code>{ascii_bar(0, PROGRESS_STEPS)}</code>", parse_mode=ParseMode.HTML)
+    for i in range(1, PROGRESS_STEPS + 1):
+        frame = f"{title}\n<code>{ascii_bar(i, PROGRESS_STEPS)}</code>"
+        msg = await safe_edit_or_resend(msg, frame, parse_mode=ParseMode.HTML)
+        await asyncio.sleep(PROGRESS_DELAY)
+    return msg
+
+
+# ----------------------------
+# Figma: detect + fetch preview (public only)
+# ----------------------------
+FIGMA_URL_RE = re.compile(r"(https?://www\.figma\.com/(file|design)/[^\s]+)", re.IGNORECASE)
+
+def extract_figma_url(text: str) -> Optional[str]:
+    m = FIGMA_URL_RE.search(text or "")
     if not m:
         return None
-    raw = m.group(1)
-    return raw.replace("%3A", ":")  # figma sometimes uses 2:88
-    # keep "1-2" as-is too
+    return m.group(1).strip()
 
+def figma_oembed_url(figma_url: str) -> str:
+    # Add cache-buster so different node-id links don't get stuck.
+    # Still depends on Figma returning node-specific preview; for some files it may not.
+    bust = int(time.time() * 1000)
+    return "https://www.figma.com/oembed?url=" + urllib.parse.quote(figma_url, safe="") + f"&_cb={bust}"
 
-# -----------------------------
-# Figma fetch via oEmbed
-# -----------------------------
+def http_get_bytes(url: str, max_bytes: int) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = r.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise RuntimeError("Preview is too large.")
+    return data
 
-async def fetch_figma_thumbnail(url: str) -> Optional[bytes]:
+def fetch_figma_preview(figma_url: str) -> Tuple[bytes, str]:
     """
-    Uses Figma oEmbed endpoint.
-    Works only if file is public and Figma provides a thumbnail.
+    Returns (image_bytes, caption).
+    Uses oEmbed thumbnail_url. Works for public files. If file is private, will fail.
     """
-    oembed = f"https://www.figma.com/api/oembed?url={pyhtml.escape(url, quote=True)}"
-    async with httpx.AsyncClient(timeout=20) as hc:
-        r = await hc.get(oembed)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        thumb = data.get("thumbnail_url")
-        if not thumb:
-            return None
-        img = await hc.get(thumb)
-        if img.status_code != 200:
-            return None
-        return img.content
+    oembed = http_get_bytes(figma_oembed_url(figma_url), max_bytes=400_000).decode("utf-8", errors="replace")
+    payload = json.loads(oembed)
+    thumb = payload.get("thumbnail_url")
+    title = payload.get("title") or "Figma"
+    if not thumb:
+        raise RuntimeError("Figma не дал thumbnail_url. Возможно, файл не публичный.")
+    img_bytes = http_get_bytes(thumb, max_bytes=MAX_PREVIEW_BYTES)
+    caption = f"{title}\n(превью из Figma)"
+    return img_bytes, caption
 
 
-# -----------------------------
-# OCR
-# -----------------------------
-
-@dataclass
-class OCRBox:
-    text: str
-    bbox: Tuple[int, int, int, int]  # x, y, w, h
-    conf: float
-
-def ocr_boxes(pil_img: Image.Image, lang: str) -> List[OCRBox]:
-    # Use tesseract TSV output for bboxes
-    # Try to reduce noise: keep only confident tokens/words.
-    tsv = pytesseract.image_to_data(pil_img, lang=lang, output_type=pytesseract.Output.DICT)
-    n = len(tsv.get("text", []))
-    out: List[OCRBox] = []
-    for i in range(n):
-        txt = (tsv["text"][i] or "").strip()
-        if not txt:
-            continue
-        try:
-            conf = float(tsv["conf"][i])
-        except Exception:
-            conf = -1.0
-        # conservative threshold
-        if conf < 45:
-            continue
-        x, y, w, h = int(tsv["left"][i]), int(tsv["top"][i]), int(tsv["width"][i]), int(tsv["height"][i])
-        out.append(OCRBox(text=txt, bbox=(x, y, w, h), conf=conf))
-    return out
-
-def ocr_text_snippet(boxes: List[OCRBox], max_tokens: int = 120) -> str:
-    # Join text in reading order approximation (tsv order is usually left-to-right-ish).
-    tokens = [b.text for b in boxes]
-    return " ".join(tokens[:max_tokens])
-
-
-# -----------------------------
-# LLM: structured output + robust parsing
-# -----------------------------
-
+# ----------------------------
+# OpenAI: Vision review with structured output
+# ----------------------------
 REVIEW_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
         "what_i_see": {"type": "string"},
-        "score_10": {"type": "integer", "minimum": 1, "maximum": 10},
-        "verdict": {"type": "string"},
-        "praise": {
-            "type": "array",
-            "items": {"type": "string"},
-            "maxItems": 6
-        },
-        "issues": {
+        "overall_score": {"type": "integer", "minimum": 1, "maximum": 10},
+
+        "visual_score": {"type": "integer", "minimum": 1, "maximum": 10},
+        "visual_praise": {"type": "array", "items": {"type": "string"}},
+        "visual_issues": {
             "type": "array",
             "items": {
                 "type": "object",
@@ -237,11 +204,43 @@ REVIEW_SCHEMA: Dict[str, Any] = {
                 "properties": {
                     "title": {"type": "string"},
                     "why_bad": {"type": "string"},
-                    "fix": {"type": "string"},
-                    "category": {"type": "string", "enum": ["ux", "copy", "visual", "accessibility", "consistency"]},
-                    # For annotation targeting:
-                    "target_text": {"type": "string"},  # optional: short snippet seen on screen
-                    "region": {
+                    "how_to_fix": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                },
+                "required": ["title", "why_bad", "how_to_fix", "severity"],
+            },
+        },
+
+        "copy_score": {"type": "integer", "minimum": 1, "maximum": 10},
+        "copy_praise": {"type": "array", "items": {"type": "string"}},
+        "copy_issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "what_wrong": {"type": "string"},
+                    "rewrite": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                    # role helps reduce "header vs button" confusion:
+                    "role_guess": {"type": "string", "enum": ["header", "button", "body", "hint", "error", "label", "unknown"]},
+                },
+                "required": ["title", "what_wrong", "rewrite", "severity", "role_guess"],
+            },
+        },
+
+        # For annotations: normalized bboxes 0..1, only where there is real text / UI element
+        "annotations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "n": {"type": "integer", "minimum": 1, "maximum": 99},
+                    "label": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+                    "bbox": {
                         "type": "object",
                         "additionalProperties": False,
                         "properties": {
@@ -250,555 +249,460 @@ REVIEW_SCHEMA: Dict[str, Any] = {
                             "w": {"type": "number", "minimum": 0, "maximum": 1},
                             "h": {"type": "number", "minimum": 0, "maximum": 1},
                         },
-                        "required": ["x", "y", "w", "h"]
+                        "required": ["x", "y", "w", "h"],
                     },
                 },
-                "required": ["title", "why_bad", "fix", "category"]
+                "required": ["n", "label", "severity", "bbox"],
             },
-            "maxItems": 10
         },
+
+        # Soft guesses, no numbers/colors:
         "font_family_guess": {"type": "string"},
-        "concept_prompt": {"type": "string"},
+        "palette_vibe_guess": {"type": "string"},
     },
-    "required": ["what_i_see", "score_10", "verdict", "praise", "issues", "font_family_guess", "concept_prompt"],
+    "required": [
+        "what_i_see",
+        "overall_score",
+        "visual_score",
+        "visual_praise",
+        "visual_issues",
+        "copy_score",
+        "copy_praise",
+        "copy_issues",
+        "annotations",
+        "font_family_guess",
+        "palette_vibe_guess",
+    ],
 }
 
-def _extract_json_text(resp: Any) -> str:
-    """
-    openai responses API can return text in different shapes.
-    We try to get the final text.
-    """
-    # New SDK often gives resp.output_text
-    if hasattr(resp, "output_text") and isinstance(resp.output_text, str) and resp.output_text.strip():
-        return resp.output_text.strip()
-    # Fallback: stringify and try to find JSON object
-    s = str(resp)
-    return s
+SYSTEM_STYLE = (
+    "Ты — старший товарищ по дизайн-ревью. "
+    "Если плохо — говори прямо и придирчиво, но без мата и без унижений. "
+    "Если хорошо — хвали и называй конкретно, что именно хорошо. "
+    "НЕ добавляй технические замеры: никаких px, чисел размеров, RGB/hex, медиан. "
+    "Про шрифты и палитру — только качественные догадки (семейство/вайб). "
+    "Не выдумывай элементы, которых не видно. "
+    "Не размазывайся — рекомендации должны быть применимыми."
+)
 
-def _safe_json_loads(s: str) -> Optional[dict]:
-    s = (s or "").strip()
-    if not s:
-        return None
-    # Try direct
-    try:
-        return json.loads(s)
-    except Exception:
-        pass
-    # Try extract first {...} block
-    m = re.search(r"\{.*\}", s, flags=re.S)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
+TASK_PROMPT = (
+    "Сделай ревью интерфейса по скриншоту.\n\n"
+    "Нужно вернуть JSON строго по схеме.\n\n"
+    "Правила:\n"
+    "- Аннотации (bbox) ставь ТОЛЬКО на области, где реально есть текст/элемент (не пустые зоны).\n"
+    "- Если не уверен в роли текста, ставь role_guess='unknown'.\n"
+    "- Тон: требовательный, прямой, но без токсичности.\n"
+    "- Что исправить: конкретика (переписать, укоротить, уточнить, сделать последовательнее, снять двусмысленность).\n"
+)
 
-def llm_review(
-    pil_img: Image.Image,
-    img_b64_data_url: str,
-    ocr_hint: str,
-) -> Dict[str, Any]:
-    assert client is not None
 
-    system = (
-        "You are a strict senior UI/UX design reviewer.\n"
-        "You must be honest, sometimes tough, but no profanity.\n"
-        "You can praise if deserved and explain what is good.\n"
-        "No technical measurement outputs: no exact font sizes, no color hex values.\n"
-        "You may guess font family.\n"
-        "Output MUST be valid JSON matching the provided schema.\n"
-        "Do not wrap text in arrays like ['...'].\n"
-        "Do not include keys like {'description': ...} in user-facing strings.\n"
-    )
+def _b64_png_from_bytes(img_bytes: bytes) -> str:
+    # ensure PNG for stable decode
+    im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
 
-    user = (
-        "Review this UI screenshot. Provide:\n"
-        "1) what_i_see: short description of the screen and user scenario.\n"
-        "2) verdict: a single message that mixes UX + copy recommendations.\n"
-        "3) score_10: overall score 1..10.\n"
-        "4) praise: 1..3 concrete praises if any.\n"
-        "5) issues: up to 8 key issues (prioritized). Each issue must include: title, why_bad, fix, category.\n"
-        "   For annotations: optionally include target_text (short snippet that exists on screen) and/or region (x,y,w,h normalized).\n"
-        "6) font_family_guess: one short guess like 'Inter', 'SF Pro', 'Roboto', 'Helvetica', etc.\n"
-        "7) concept_prompt: a prompt to generate a concept redesign image (same language as the UI, keep meaning, improve hierarchy).\n\n"
-        f"OCR hint (may be imperfect): {ocr_hint}\n"
-    )
 
-    # We’ll use Responses API with json_schema formatting
+def call_llm_review(img_bytes: bytes) -> Dict[str, Any]:
+    img_b64 = _b64_png_from_bytes(img_bytes)
+    data_url = "data:image/png;base64," + img_b64
+
     resp = client.responses.create(
         model=LLM_MODEL,
         input=[
-            {"role": "system", "content": [{"type": "input_text", "text": system}]},
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": SYSTEM_STYLE}],
+            },
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": user},
-                    {"type": "input_image", "image_url": img_b64_data_url},
+                    {"type": "input_text", "text": TASK_PROMPT},
+                    {"type": "input_image", "image_url": data_url},
                 ],
             },
         ],
         text={
             "format": {
                 "type": "json_schema",
-                "name": "design_reviewer_v1",
+                "name": "ui_review",
                 "schema": REVIEW_SCHEMA,
             }
         },
-        max_output_tokens=900,
     )
 
-    txt = _extract_json_text(resp)
-    data = _safe_json_loads(txt)
-    if not data:
-        # Last resort: still provide a controlled fallback
-        raise ValueError("LLM returned invalid JSON")
-    return data
-
-
-# -----------------------------
-# Annotation image rendering
-# -----------------------------
-
-def _load_font(size: int = 18) -> ImageFont.FreeTypeFont:
-    # Use a built-in fallback if system fonts are not available
-    # Try common fonts first
-    candidates = [
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",   # mac
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",        # linux
-    ]
-    for p in candidates:
+    # openai Responses returns text in output_text convenience; keep robust:
+    raw = getattr(resp, "output_text", None)
+    if not raw:
+        # fallback: try to stitch output parts
+        raw = ""
         try:
-            if Path(p).exists():
-                return ImageFont.truetype(p, size=size)
+            for o in resp.output:
+                for c in getattr(o, "content", []) or []:
+                    if getattr(c, "type", "") in ("output_text", "text"):
+                        raw += getattr(c, "text", "") or ""
         except Exception:
+            pass
+
+    raw = (raw or "").strip()
+
+    try:
+        return json.loads(raw)
+    except Exception:
+        # If model returns something weird (rare), try to extract first JSON block
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        if m:
+            return json.loads(m.group(0))
+        raise RuntimeError("LLM вернул невалидный JSON. Пришли тот же скрин ещё раз (или чуть крупнее).")
+
+
+# ----------------------------
+# Annotations: draw markers
+# ----------------------------
+def clamp01(v: float) -> float:
+    return max(0.0, min(1.0, v))
+
+def severity_char(sev: str) -> str:
+    # monochrome markers
+    return {"high": "!", "medium": "~", "low": "."}.get(sev, ".")
+
+def draw_annotations(img_bytes: bytes, ann: List[Dict[str, Any]]) -> bytes:
+    im = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = im.size
+    draw = ImageDraw.Draw(im)
+
+    # Try to load a default font; fallback to PIL built-in.
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+
+    # Draw numbered boxes
+    for a in ann[:60]:
+        bbox = a.get("bbox") or {}
+        x = int(clamp01(float(bbox.get("x", 0))) * w)
+        y = int(clamp01(float(bbox.get("y", 0))) * h)
+        bw = int(clamp01(float(bbox.get("w", 0))) * w)
+        bh = int(clamp01(float(bbox.get("h", 0))) * h)
+
+        # Avoid degenerate boxes
+        if bw < 6 or bh < 6:
             continue
-    return ImageFont.load_default()
 
-def _best_match_box(boxes: List[OCRBox], target_text: str) -> Optional[OCRBox]:
-    if not target_text:
-        return None
-    t = target_text.strip().lower()
-    if not t:
-        return None
+        x2, y2 = x + bw, y + bh
+        n = str(a.get("n", "?"))
+        sev = str(a.get("severity", "low"))
 
-    # Prefer boxes that contain the token (or part of it)
-    best = None
-    best_score = 0.0
+        # Simple high-contrast black/white
+        draw.rectangle([x, y, x2, y2], outline="white", width=3)
+        draw.rectangle([x+1, y+1, x2-1, y2-1], outline="black", width=1)
 
-    for b in boxes:
-        s = b.text.lower()
-        score = 0.0
-        if s == t:
-            score = 1.0
-        elif t in s or s in t:
-            score = 0.7
-        else:
-            # weak fuzzy: common prefix length
-            pref = 0
-            for a, c in zip(s, t):
-                if a == c:
-                    pref += 1
-                else:
-                    break
-            score = pref / max(1, max(len(s), len(t)))
-        score = score * (0.5 + min(0.5, b.conf / 100.0))
-        if score > best_score:
-            best_score = score
-            best = b
+        tag = f"{n}{severity_char(sev)}"
+        # label background
+        tx, ty = x + 4, max(0, y - 14)
+        draw.rectangle([tx - 2, ty - 2, tx + 40, ty + 14], fill="black")
+        draw.text((tx, ty), tag, fill="white", font=font)
 
-    if best_score < 0.35:
-        return None
-    return best
-
-def render_annotated(
-    base_img: Image.Image,
-    issues: List[Dict[str, Any]],
-    boxes: List[OCRBox],
-) -> Image.Image:
-    img = base_img.convert("RGBA")
-    draw = ImageDraw.Draw(img)
-    font = _load_font(18)
-    font_small = _load_font(16)
-
-    W, H = img.size
-    pad = max(3, int(min(W, H) * 0.003))
-
-    # Retro-ish monochrome annotation style: black outline + white fill label
-    def draw_label(x: int, y: int, text: str) -> None:
-        text = (text or "").strip()
-        if not text:
-            return
-        # background
-        tw, th = draw.textbbox((0, 0), text, font=font_small)[2:]
-        bx1, by1 = x, y
-        bx2, by2 = x + tw + 10, y + th + 8
-        draw.rectangle([bx1, by1, bx2, by2], fill=(255, 255, 255, 235), outline=(0, 0, 0, 255), width=2)
-        draw.text((x + 5, y + 4), text, font=font_small, fill=(0, 0, 0, 255))
-
-    # Limit to avoid clutter
-    issues_to_draw = issues[:8]
-
-    for idx, it in enumerate(issues_to_draw, start=1):
-        title = (it.get("title") or "").strip()
-        target_text = (it.get("target_text") or "").strip()
-
-        # Determine box
-        box = _best_match_box(boxes, target_text) if target_text else None
-
-        if box:
-            x, y, w, h = box.bbox
-        else:
-            reg = it.get("region") or None
-            if isinstance(reg, dict):
-                x = int((reg.get("x", 0.1)) * W)
-                y = int((reg.get("y", 0.1)) * H)
-                w = int((reg.get("w", 0.2)) * W)
-                h = int((reg.get("h", 0.08)) * H)
-            else:
-                # fallback: top-left-ish
-                x, y, w, h = int(0.08 * W), int(0.12 * H) + idx * 10, int(0.2 * W), int(0.08 * H)
-
-        # Clamp
-        x = max(0, min(x, W - 1))
-        y = max(0, min(y, H - 1))
-        w = max(10, min(w, W - x))
-        h = max(10, min(h, H - y))
-
-        # Draw rectangle (monochrome)
-        draw.rectangle([x - pad, y - pad, x + w + pad, y + h + pad], outline=(0, 0, 0, 255), width=4)
-
-        # Number bubble
-        bubble = f"{idx}"
-        bw, bh = draw.textbbox((0, 0), bubble, font=font)[2:]
-        bx1, by1 = x - pad, max(0, y - bh - 14)
-        bx2, by2 = bx1 + bw + 14, by1 + bh + 10
-        draw.rectangle([bx1, by1, bx2, by2], fill=(0, 0, 0, 255), outline=(0, 0, 0, 255))
-        draw.text((bx1 + 7, by1 + 5), bubble, font=font, fill=(255, 255, 255, 255))
-
-        # Short label near box
-        short = title
-        if len(short) > 42:
-            short = short[:39].rstrip() + "…"
-        draw_label(min(W - 220, x + w + 10), min(H - 40, y), short)
-
-    return img.convert("RGB")
+    out = io.BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
 
 
-# -----------------------------
+# ----------------------------
 # Concept image generation
-# -----------------------------
+# ----------------------------
+def generate_concept_image(review: Dict[str, Any], base_img_bytes: bytes) -> Optional[bytes]:
+    if not CONCEPT_ENABLED:
+        return None
 
-def generate_concept_image(concept_prompt: str, target_size: Tuple[int, int]) -> Image.Image:
-    """
-    Generates a concept image using Images API (gpt-image-1) and resizes to target_size.
-    If your account/model availability differs, change model accordingly.
-    """
-    assert client is not None
+    # Keep it practical: produce a "cleaner" concept UI.
+    # We avoid exact brand colors/sizes and focus on structure.
+    what = (review.get("what_i_see") or "").strip()
+    visual_issues = review.get("visual_issues") or []
+    copy_issues = review.get("copy_issues") or []
 
-    W, H = target_size
-
-    # Choose a supported size closest to aspect ratio
-    # Common supported sizes: 1024x1024, 1536x1024, 1024x1536
-    if W >= H:
-        gen_size = "1536x1024" if (W / max(1, H)) > 1.15 else "1024x1024"
-    else:
-        gen_size = "1024x1536" if (H / max(1, W)) > 1.15 else "1024x1024"
+    # Build a tight prompt (no explicit color codes/sizes)
+    top_visual = "; ".join([i.get("title","") for i in visual_issues[:5] if isinstance(i, dict)])
+    top_copy = "; ".join([i.get("title","") for i in copy_issues[:5] if isinstance(i, dict)])
 
     prompt = (
-        "Create a CONCEPT UI mock based on the following guidance.\n"
-        "Important: this is a draft direction, not pixel-perfect.\n"
-        "Keep the same language as the original UI.\n"
-        "Improve hierarchy, clarity, spacing, and CTA focus.\n"
-        "No decorative nonsense.\n\n"
-        f"{concept_prompt}\n"
+        "Create a redesigned concept of the same UI screen from the provided screenshot. "
+        "Keep the same purpose and content, but improve clarity, hierarchy, spacing, and readability. "
+        "No flashy decorations. Business product UI. "
+        "Do not invent new features; refine layout and microcopy. "
+        f"Observed screen: {what}\n"
+        f"Main visual issues to address: {top_visual}\n"
+        f"Main copy issues to address: {top_copy}\n"
+        "Output: a clean, modern UI concept screenshot-style image."
     )
 
-    img_resp = client.images.generate(
-        model="gpt-image-1",
+    # Use Images API (OpenAI docs). GPT image models return base64.
+    # https://platform.openai.com/docs/api-reference/images
+    img_b64 = _b64_png_from_bytes(base_img_bytes)
+    data_url = "data:image/png;base64," + img_b64
+
+    res = client.images.generate(
+        model=IMAGE_MODEL,
         prompt=prompt,
-        size=gen_size,
+        size="1024x1024",
+        # Provide reference image if supported by your plan/model via prompt only (safe default).
+        # If your setup supports edits, you can switch to image edits flow later.
     )
 
-    # openai images response typically contains base64 data
-    b64 = img_resp.data[0].b64_json
-    raw = base64.b64decode(b64)
-    im = Image.open(BytesIO(raw)).convert("RGB")
-
-    # Resize to exact screenshot size (as you requested)
-    im = im.resize((W, H), Image.LANCZOS)
-    return im
-
-
-# -----------------------------
-# Telegram: formatting helpers
-# -----------------------------
-
-def safe_text(s: str) -> str:
-    # Avoid accidental HTML entities in Telegram
-    return pyhtml.escape((s or "").strip())
-
-def format_message_what_i_see(what: str, font_guess: str) -> str:
-    return (
-        "WHAT I SEE\n"
-        f"{safe_text(what)}\n\n"
-        f"Font family (guess): {safe_text(font_guess)}"
-    )
-
-def format_message_verdict(score_10: int, verdict: str, praise: List[str], issues: List[Dict[str, Any]]) -> str:
-    parts: List[str] = []
-    parts.append(f"VERDICT — {int(score_10)}/10\n")
-    parts.append(safe_text(verdict).strip())
-
-    # Praise (keep short)
-    praise_clean = [p.strip() for p in (praise or []) if p and p.strip()]
-    if praise_clean:
-        parts.append("\nWHAT'S GOOD")
-        for p in praise_clean[:3]:
-            parts.append(f"• {safe_text(p)}")
-
-    # Issues (summarized)
-    issues_clean = issues or []
-    if issues_clean:
-        parts.append("\nMAIN ISSUES (PRIORITY)")
-        for i, it in enumerate(issues_clean[:6], start=1):
-            title = safe_text(it.get("title", "Issue"))
-            why = safe_text(it.get("why_bad", "")).strip()
-            fix = safe_text(it.get("fix", "")).strip()
-            # Keep concise, but actionable
-            parts.append(f"{i}. {title}")
-            if why:
-                parts.append(f"   Why: {why}")
-            if fix:
-                parts.append(f"   Fix: {fix}")
-
-    return "\n".join(parts).strip()
-
-
-# -----------------------------
-# Router / Handlers
-# -----------------------------
-
-router = Router()
-
-
-@router.message(Command("start"))
-async def cmd_start(m: Message) -> None:
-    txt = (
-        "Design Reviewer online.\n"
-        "Send a screenshot or a public Figma frame link.\n"
-        "I'll be honest: I will praise what works and call out what doesn't."
-    )
-    await m.answer(txt, reply_markup=MAIN_KB)
-
-
-@router.message(Command("ping"))
-async def cmd_ping(m: Message) -> None:
-    await m.answer("pong", reply_markup=MAIN_KB)
-
-
-@router.message(F.text == BTN_HOW)
-async def how_it_works(m: Message) -> None:
-    txt = (
-        "HOW IT WORKS\n"
-        "1) Send a screenshot or a public Figma frame link\n"
-        "2) Get: what I see, verdict + fixes, annotated screenshot, concept draft\n"
-        "That's it."
-    )
-    await m.answer(txt, reply_markup=MAIN_KB)
-
-
-@router.message(F.text == BTN_PING)
-async def ping_button(m: Message) -> None:
-    await cmd_ping(m)
-
-
-@router.message(F.text == BTN_SUBMIT)
-async def submit_button(m: Message) -> None:
-    await m.answer(
-        "Send a screenshot or a public Figma frame link.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    await m.answer("Menu is still available anytime with /start.", reply_markup=MAIN_KB)
-
-
-async def download_telegram_photo(m: Message) -> Optional[bytes]:
-    if not m.photo:
-        return None
-    photo = m.photo[-1]
-    file = await m.bot.get_file(photo.file_id)
-    buf = BytesIO()
-    await m.bot.download_file(file.file_path, destination=buf)
-    return buf.getvalue()
-
-
-def to_data_url_png(img_bytes: bytes) -> Tuple[str, Image.Image]:
-    pil = Image.open(BytesIO(img_bytes)).convert("RGB")
-    out = BytesIO()
-    pil.save(out, format="PNG")
-    b = out.getvalue()
-    b64 = base64.b64encode(b).decode("utf-8")
-    return f"data:image/png;base64,{b64}", pil
-
-
-def img_bytes_from_pil(pil: Image.Image, fmt: str = "PNG") -> bytes:
-    bio = BytesIO()
-    pil.save(bio, format=fmt)
-    return bio.getvalue()
-
-
-def cache_key_for_request(img_bytes: bytes, source_tag: str) -> str:
-    h = hashlib.sha256(img_bytes).hexdigest()[:16]
-    return f"{source_tag}:{h}:{int(time.time()*1000)}"  # include time to avoid reusing wrong previews
-
-
-@router.message(F.content_type == ContentType.PHOTO)
-async def handle_photo(m: Message) -> None:
+    # SDK returns base64 for GPT image models
+    b64_out = None
     try:
-        raw = await download_telegram_photo(m)
-        if not raw:
-            await m.answer("I didn't get the image. Try again.")
-            return
+        b64_out = res.data[0].b64_json
+    except Exception:
+        pass
 
-        await process_image_request(m, raw, source_tag="tg_photo")
-
-    except Exception as e:
-        await m.answer(f"Processing crashed: {safe_text(str(e))}")
+    if not b64_out:
+        return None
+    return base64.b64decode(b64_out)
 
 
-@router.message(F.text & F.text.len() > 0)
-async def handle_text(m: Message) -> None:
-    text = (m.text or "").strip()
+# ----------------------------
+# Formatting: output messages
+# ----------------------------
+def fmt_score_line(name: str, score: int) -> str:
+    # monochrome, no colored emoji
+    return f"{name}: {score}/10"
 
-    if is_figma_url(text):
-        await m.answer("Got it. Trying to fetch a preview from Figma…", reply_markup=MAIN_KB)
-        node_id = extract_node_id(text)
-        thumb = None
+def bullet(lines: List[str], limit: int = 8) -> str:
+    out = []
+    for s in lines[:limit]:
+        s = (s or "").strip()
+        if not s:
+            continue
+        out.append(f"- {s}")
+    return "\n".join(out) if out else "- (нет)"
 
-        try:
-            thumb = await fetch_figma_thumbnail(text)
-        except Exception:
-            thumb = None
+def fmt_issue_block(title: str, why: str, how: str, sev: str) -> str:
+    sev_tag = {"high": "[!]", "medium": "[~]", "low": "[.]"}[sev]
+    return (
+        f"{sev_tag} {title}\n"
+        f"  Что не так: {why}\n"
+        f"  Как улучшить: {how}"
+    )
 
-        if not thumb:
-            await m.answer(
-                "I couldn't fetch a preview.\n"
-                "Make sure the Figma file is public and the link is correct.",
-                reply_markup=MAIN_KB,
+def build_verdict(review: Dict[str, Any]) -> str:
+    overall = int(review.get("overall_score", 5))
+    vscore = int(review.get("visual_score", 5))
+    cscore = int(review.get("copy_score", 5))
+
+    font_guess = (review.get("font_family_guess") or "").strip()
+    palette_guess = (review.get("palette_vibe_guess") or "").strip()
+
+    vp = review.get("visual_praise") or []
+    cp = review.get("copy_praise") or []
+
+    vis_issues = review.get("visual_issues") or []
+    copy_issues = review.get("copy_issues") or []
+
+    # Build strict but fair tone
+    lines = []
+    lines.append("Вердикт")
+    lines.append(fmt_score_line("Общая оценка", overall))
+    lines.append(fmt_score_line("Визуал", vscore))
+    lines.append(fmt_score_line("Текст", cscore))
+    lines.append("")
+
+    if font_guess or palette_guess:
+        lines.append("Быстрые догадки (без занудства):")
+        if font_guess:
+            lines.append(f"- Шрифт: похоже на {font_guess}")
+        if palette_guess:
+            lines.append(f"- Палитра: {palette_guess}")
+        lines.append("")
+
+    # Praise first (keeps it buddy-like)
+    if vp or cp:
+        lines.append("Что хорошо (и это стоит сохранить):")
+        if vp:
+            lines.append("Визуал:")
+            lines.append(bullet([str(x) for x in vp], limit=5))
+        if cp:
+            lines.append("Текст:")
+            lines.append(bullet([str(x) for x in cp], limit=5))
+        lines.append("")
+
+    lines.append("Что чинить в первую очередь:")
+    # Prioritize high severity issues
+    def sort_key(i: Dict[str, Any]) -> int:
+        sev = str(i.get("severity", "low"))
+        return {"high": 0, "medium": 1, "low": 2}.get(sev, 3)
+
+    # Visual issues
+    vis_sorted = [i for i in vis_issues if isinstance(i, dict)]
+    vis_sorted.sort(key=sort_key)
+    if vis_sorted:
+        lines.append("Визуал:")
+        for i in vis_sorted[:4]:
+            lines.append(fmt_issue_block(
+                str(i.get("title","")).strip() or "Проблема",
+                str(i.get("why_bad","")).strip() or "—",
+                str(i.get("how_to_fix","")).strip() or "—",
+                str(i.get("severity","low")),
+            ))
+    else:
+        lines.append("Визуал:\n- (нет)")
+
+    # Copy issues
+    copy_sorted = [i for i in copy_issues if isinstance(i, dict)]
+    copy_sorted.sort(key=sort_key)
+    if copy_sorted:
+        lines.append("")
+        lines.append("Текст:")
+        for i in copy_sorted[:4]:
+            title = str(i.get("title","")).strip() or "Проблема"
+            wrong = str(i.get("what_wrong","")).strip() or "—"
+            rewrite = str(i.get("rewrite","")).strip() or "—"
+            sev = str(i.get("severity","low"))
+            sev_tag = {"high": "[!]", "medium": "[~]", "low": "[.]"}[sev]
+            role = str(i.get("role_guess","unknown"))
+            lines.append(
+                f"{sev_tag} {title} (роль: {role})\n"
+                f"  Что не так: {wrong}\n"
+                f"  Как лучше: {rewrite}"
             )
-            return
+    else:
+        lines.append("\nТекст:\n- (нет)")
 
-        # Show preview image (as requested)
+    return "\n".join(lines).strip()
+
+
+# ----------------------------
+# Core processing
+# ----------------------------
+async def process_image_and_reply(msg: Message, img_bytes: bytes, source_note: Optional[str] = None) -> None:
+    # Progress 1
+    await animate_progress(msg, title="Смотрю внимательно")
+
+    review = call_llm_review(img_bytes)
+
+    # 1) what i see
+    what = (review.get("what_i_see") or "").strip()
+    if source_note:
+        await msg.answer(source_note)
+    await msg.answer(what if what else "(не смог разобрать, что на экране)")
+
+    # 2) verdict
+    verdict = build_verdict(review)
+    await msg.answer(verdict)
+
+    # 3) annotated screenshot
+    ann = review.get("annotations") or []
+    try:
+        annotated = draw_annotations(img_bytes, ann if isinstance(ann, list) else [])
+        await msg.answer_photo(
+            BufferedInputFile(annotated, filename="annotations.png"),
+            caption="Аннотации на скрине (метки = куда смотреть)",
+        )
+    except Exception:
+        await msg.answer("Аннотации не нарисовал: что-то пошло не так при разметке картинки.")
+
+    # Progress 2 (before concept)
+    if CONCEPT_ENABLED:
+        await animate_progress(msg, title="Собираю концепт")
+
+        concept = None
+        try:
+            concept = generate_concept_image(review, img_bytes)
+        except Exception:
+            concept = None
+
+        if concept:
+            await msg.answer_photo(
+                BufferedInputFile(concept, filename="concept.png"),
+                caption="Концепт: как могло бы быть (черновик направления)",
+            )
+        else:
+            await msg.answer("Концепт не сгенерировался (модель/лимиты/формат).")
+
+
+# ----------------------------
+# Handlers
+# ----------------------------
+@router.message(F.text == "/start")
+async def start_cmd(m: Message):
+    await m.answer(WELCOME_TEXT, reply_markup=main_menu())
+
+@router.callback_query(F.data == BTN_REVIEW)
+async def cb_review(c: CallbackQuery):
+    await c.message.answer("Ок. Кидай скриншот или ссылку на публичный Figma фрейм.", reply_markup=main_menu())
+    await c.answer()
+
+@router.callback_query(F.data == BTN_HOW)
+async def cb_how(c: CallbackQuery):
+    await c.message.answer(HOW_TEXT, reply_markup=main_menu())
+    await c.answer()
+
+@router.callback_query(F.data == BTN_PING)
+async def cb_ping(c: CallbackQuery):
+    await c.message.answer(PING_TEXT, reply_markup=main_menu())
+    await c.answer()
+
+@router.message(F.photo)
+async def on_photo(m: Message):
+    # Take best quality photo
+    ph = m.photo[-1]
+    file = await m.bot.get_file(ph.file_id)
+    data = await m.bot.download_file(file.file_path)
+    img_bytes = data.read()
+    await process_image_and_reply(m, img_bytes)
+
+@router.message(F.document)
+async def on_document(m: Message):
+    # Allow image as document
+    doc = m.document
+    if not doc or not (doc.mime_type or "").startswith("image/"):
+        await m.answer("Я беру на ревью только картинки (или ссылку на Figma фрейм).", reply_markup=main_menu())
+        return
+    file = await m.bot.get_file(doc.file_id)
+    data = await m.bot.download_file(file.file_path)
+    img_bytes = data.read()
+    await process_image_and_reply(m, img_bytes)
+
+@router.message(F.text)
+async def on_text(m: Message):
+    url = extract_figma_url(m.text or "")
+    if not url:
+        await m.answer(
+            "Я принимаю на ревью:\n- скриншоты (картинки)\n- ссылки на Figma фреймы (если файл публичный)\n\n"
+            "Жми «Закинуть на ревью» или просто отправь скрин/ссылку.",
+            reply_markup=main_menu(),
+        )
+        return
+
+    # Try to fetch preview
+    try:
+        preview_bytes, caption = fetch_figma_preview(url)
         await m.answer_photo(
-            photo=thumb,
-            caption=("Figma preview" + (f" (node-id={node_id})" if node_id else "")),
+            BufferedInputFile(preview_bytes, filename="figma_preview.png"),
+            caption=caption,
+        )
+        note = "Источник: Figma превью (если у Figma одно превью на весь файл — разные node-id могут выглядеть одинаково)."
+        await process_image_and_reply(m, preview_bytes, source_note=note)
+    except Exception as e:
+        await m.answer(
+            f"Не смог скачать превью из Figma.\nПричина: {str(e)}\n\n"
+            "Проверь, что файл публичный, и попробуй ещё раз.",
+            reply_markup=main_menu(),
         )
 
-        # Then process like a normal screenshot
-        await process_image_request(m, thumb, source_tag=f"figma:{node_id or 'no_node'}")
-        return
 
-    # Default fallback
-    if text in ("/start", "/ping"):
-        return
-
-    await m.answer(
-        "I can review:\n"
-        "• screenshots (images)\n"
-        "• public Figma frame links\n\n"
-        "Use the menu or just send a screenshot/link.",
-        reply_markup=MAIN_KB,
-    )
-
-
-async def process_image_request(m: Message, img_bytes: bytes, source_tag: str) -> None:
-    # New request — no cross-request cache.
-    # (This avoids the “every link returns the same thing” bug.)
-    req_id = cache_key_for_request(img_bytes, source_tag)
-
-    # Step 0: initial progress (retro)
-    await m.answer(f"<code>{pyhtml.escape(ascii_line(0, 'LOOKING…'))}</code>")
-
-    data_url, pil = to_data_url_png(img_bytes)
-
-    # OCR first (helps targeting + reduces “boxes on empty areas”)
-    try:
-        boxes = ocr_boxes(pil, OCR_LANG)
-        ocr_hint = ocr_text_snippet(boxes)
-    except Exception:
-        boxes = []
-        ocr_hint = ""
-
-    if not LLM_ENABLED:
-        await m.answer("LLM is disabled (LLM_ENABLED=false). Enable it to get reviews.")
-        return
-
-    # Step 1: LLM review (structured)
-    await m.answer(f"<code>{pyhtml.escape(ascii_line(3, 'READING…'))}</code>")
-    review = llm_review(pil_img=pil, img_b64_data_url=data_url, ocr_hint=ocr_hint)
-
-    what_i_see = review.get("what_i_see", "").strip()
-    score_10 = int(review.get("score_10", 6))
-    verdict = review.get("verdict", "").strip()
-    praise = review.get("praise", []) or []
-    issues = review.get("issues", []) or []
-    font_guess = review.get("font_family_guess", "").strip()
-    concept_prompt = review.get("concept_prompt", "").strip()
-
-    # Message 1: What I see
-    await m.answer(format_message_what_i_see(what_i_see, font_guess), reply_markup=MAIN_KB)
-
-    # Message 2: Verdict & recommendations (UX + copy in one)
-    await m.answer(format_message_verdict(score_10, verdict, praise, issues), reply_markup=MAIN_KB)
-
-    # Message 3: Annotated screenshot
-    await m.answer(f"<code>{pyhtml.escape(ascii_line(6, 'MARKING…'))}</code>")
-    annotated = render_annotated(base_img=pil, issues=issues, boxes=boxes)
-    ann_bytes = img_bytes_from_pil(annotated, fmt="PNG")
-
-    # Short legend in caption (avoid clutter)
-    legend_lines = []
-    for i, it in enumerate(issues[:8], start=1):
-        t = (it.get("title") or "").strip()
-        if t:
-            if len(t) > 60:
-                t = t[:57].rstrip() + "…"
-            legend_lines.append(f"{i}. {t}")
-    caption = "Annotations\n" + ("\n".join(legend_lines) if legend_lines else "Key areas marked.")
-    await m.answer_photo(photo=ann_bytes, caption=caption)
-
-    # ASCII progress between 3 and 4 (as requested)
-    await send_ascii_progress(m, label="DRAFTING CONCEPT…", delay=0.10)
-
-    # Message 4: Concept (image, resized to original screenshot size)
-    await m.answer(f"<code>{pyhtml.escape(ascii_line(9, 'RENDERING…'))}</code>")
-
-    # Generate concept and force exact screenshot size
-    concept_img = generate_concept_image(concept_prompt, target_size=pil.size)
-    concept_bytes = img_bytes_from_pil(concept_img, fmt="PNG")
-
-    await m.answer_photo(
-        photo=concept_bytes,
-        caption="Concept draft. Not pixel-perfect. One possible direction.",
-    )
-
-
-# -----------------------------
-# Main
-# -----------------------------
-
-async def main() -> None:
-    dp = Dispatcher()
-    dp.include_router(router)
-
+# ----------------------------
+# Entrypoint
+# ----------------------------
+async def main():
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-
-    print(f"OK: starting bot… OCR_LANG={OCR_LANG}, LLM_ENABLED={LLM_ENABLED}, model={LLM_MODEL}")
+    dp = Dispatcher()
+    dp.include_router(router)
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
