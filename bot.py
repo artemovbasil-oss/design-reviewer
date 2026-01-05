@@ -4,23 +4,24 @@
 """
 Design Reviewer Telegram Bot (aiogram v3)
 
-What it does:
-- Accepts screenshots (photo/document image) OR public Figma frame links
-- Shows retro ASCII progress animation while processing
-- Allows cancel during processing
-- Sends 4 outputs per review:
-  1) What I see on the screen
+- Accepts screenshots OR public Figma frame links
+- Retro ASCII progress animation (monospace)
+- Cancel button during processing
+- 4 outputs per review:
+  1) What I see
   2) Verdict + recommendations (UX + Text) + score /10
   3) Annotated screenshot (numbered callouts)
-  4) ASCII concept alternative (retro wireframe)
+  4) ASCII concept alternative (monospace)
 
-Important UX rules implemented:
+UX rules:
 - Main menu buttons appear ONLY:
     - after /start
     - at the END of each review (or after error/cancel)
-- During processing: only "Cancel" inline button is shown
-- No dotenv, no requests, no httpx (Railway-friendly)
-- Avoids Telegram HTML parsing problems by sending plain text (no parse_mode)
+- During processing: only "Cancel" inline button
+
+Languages:
+- Default: EN
+- Toggle via menu button "Language: EN/RU"
 """
 
 import asyncio
@@ -29,18 +30,15 @@ import io
 import json
 import os
 import re
-import time
-import html as py_html
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 import pytesseract
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ContentType
+from aiogram.enums import ContentType, ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
@@ -54,7 +52,7 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 
-# Optional LLM
+# Optional OpenAI SDK
 try:
     from openai import OpenAI
 except Exception:
@@ -78,7 +76,7 @@ MAX_PREVIEW_BYTES = 8 * 1024 * 1024
 
 # Timeouts (seconds)
 OCR_TIMEOUT = 25
-LLM_TIMEOUT = 65
+LLM_TIMEOUT = 75
 FIGMA_OEMBED_TIMEOUT = 15
 FIGMA_DOWNLOAD_TIMEOUT = 20
 
@@ -91,16 +89,135 @@ router = Router()
 # Active review cancel events per chat
 active_reviews: Dict[int, asyncio.Event] = {}
 
+# Per-chat language (default EN)
+chat_lang: Dict[int, str] = {}  # "EN" / "RU"
+
+
+# =========================
+# I18N
+# =========================
+def lang_of(chat_id: int) -> str:
+    return chat_lang.get(chat_id, "EN")
+
+
+def t(chat_id: int, key: str) -> str:
+    L = lang_of(chat_id)
+    EN = {
+        "start_title": "Design Reviewer.",
+        "start_body": (
+            "I accept for review:\n"
+            "- screenshots (images)\n"
+            "- public Figma frame links (if the file is public)\n\n"
+            "Use the menu or just send a screenshot/link."
+        ),
+        "btn_send": "1) Send for review (screenshot/link)",
+        "btn_how": "2) How it works?",
+        "btn_channel": "3) Product Design channel @prodooktovy",
+        "btn_lang_en": "Language: EN (tap to switch)",
+        "btn_lang_ru": "Язык: RU (нажми, чтобы переключить)",
+        "how": (
+            "How it works:\n"
+            "1) Send a screenshot OR a public Figma frame link\n"
+            "2) I analyze what’s on screen\n"
+            "3) You get: what I see + verdict + annotations + ASCII concept\n\n"
+            "Tip: clearer screenshots = better feedback."
+        ),
+        "send_hint": "Send a screenshot image or paste a public Figma frame link.",
+        "channel": "Product Design channel:",
+        "cancelled": "Cancelled. Send another screenshot or a public Figma frame link.",
+        "timeout": "Timed out. Send the same screen again (preferably larger / clearer).",
+        "img_too_large": "Image too large. Send a smaller screenshot.",
+        "doc_need_img": "Send an image file (PNG/JPG) or a Figma link.",
+        "figma_bad_link": (
+            "I can review:\n- screenshots (images)\n- public Figma frame links (file must be public)\n\n"
+            "Send a screenshot or a Figma link with node-id."
+        ),
+        "text_alone": "Send a screenshot or a public Figma frame link. Text alone isn’t enough.",
+        "done": "Done. Send another screenshot or a public Figma frame link.",
+        "what_i_see": "WHAT I SEE:",
+        "annotations_caption": "ANNOTATIONS: numbers match CALLOUTS list above.",
+        "concept_title": "CONCEPT (ASCII):",
+        "figma_preview_caption": "Figma preview fetched. Reviewing now...",
+        "fetch_failed": "Could not fetch Figma preview: ",
+        "fetch_timeout": "Figma fetch timed out. Try again.",
+        "processing_failed": "Processing failed: ",
+        "llm_disabled": "LLM is disabled; using fallback review.",
+        "llm_missing_key": "OPENAI_API_KEY is missing; using fallback review.",
+        "llm_sdk_missing": "OpenAI SDK not available; using fallback review.",
+        "llm_error_prefix": "LLM error; using fallback review: ",
+        "verdict_title": "VERDICT:",
+        "good": "GOOD (keep it):",
+        "ux": "UX (fix it):",
+        "text": "TEXT (fix it):",
+        "callouts": "CALLOUTS:",
+        "annot_fail": "Annotations failed this time. The written feedback still applies.",
+    }
+    RU = {
+        "start_title": "Design Reviewer.",
+        "start_body": (
+            "Я принимаю на ревью:\n"
+            "- скриншоты (картинки)\n"
+            "- публичные ссылки на Figma фреймы (если файл публичный)\n\n"
+            "Жми кнопки или просто отправь скрин/ссылку."
+        ),
+        "btn_send": "1) Закинуть на ревью (скрин/ссылка)",
+        "btn_how": "2) Как это работает?",
+        "btn_channel": "3) Канал о проддизайне @prodooktovy",
+        "btn_lang_en": "Language: EN (tap to switch)",
+        "btn_lang_ru": "Язык: RU (нажми, чтобы переключить)",
+        "how": (
+            "Как это работает:\n"
+            "1) Отправь скриншот ИЛИ публичную ссылку на Figma фрейм\n"
+            "2) Я разберу, что на экране\n"
+            "3) Ты получишь: что вижу + вердикт + аннотации + ASCII-концепт\n\n"
+            "Совет: чем четче скрин — тем полезнее ревью."
+        ),
+        "send_hint": "Отправь картинку-скриншот или вставь публичную ссылку на фрейм Figma.",
+        "channel": "Канал о продуктовом дизайне:",
+        "cancelled": "Отменено. Отправь новый скриншот или публичную Figma-ссылку.",
+        "timeout": "Таймаут. Пришли тот же скрин ещё раз (лучше крупнее/четче).",
+        "img_too_large": "Картинка слишком большая. Пришли меньший файл.",
+        "doc_need_img": "Нужен файл-картинка (PNG/JPG) или ссылка на Figma.",
+        "figma_bad_link": (
+            "Я могу ревьюить:\n- скриншоты (картинки)\n- ссылки на Figma фреймы (если файл публичный)\n\n"
+            "Пришли скриншот или Figma ссылку с node-id."
+        ),
+        "text_alone": "Нужен скриншот или публичная ссылка на Figma. Текст сам по себе — мало.",
+        "done": "Готово. Отправь следующий скриншот или публичную Figma-ссылку.",
+        "what_i_see": "ЧТО Я ВИЖУ:",
+        "annotations_caption": "АННОТАЦИИ: номера соответствуют списку CALLOUTS выше.",
+        "concept_title": "КОНЦЕПТ (ASCII):",
+        "figma_preview_caption": "Превью из Figma получено. Делаю ревью...",
+        "fetch_failed": "Не смог скачать превью из Figma: ",
+        "fetch_timeout": "Таймаут при получении Figma. Попробуй снова.",
+        "processing_failed": "Ошибка обработки: ",
+        "llm_disabled": "LLM выключен; использую fallback-ревью.",
+        "llm_missing_key": "Нет OPENAI_API_KEY; использую fallback-ревью.",
+        "llm_sdk_missing": "Нет OpenAI SDK; использую fallback-ревью.",
+        "llm_error_prefix": "Ошибка LLM; fallback-ревью: ",
+        "verdict_title": "ВЕРДИКТ:",
+        "good": "ХОРОШО (сохрани):",
+        "ux": "UX (починить):",
+        "text": "ТЕКСТ (починить):",
+        "callouts": "CALLOUTS:",
+        "annot_fail": "Аннотации не получились. Но текстовые рекомендации актуальны.",
+    }
+    return (EN if L == "EN" else RU).get(key, key)
+
 
 # =========================
 # UI: MAIN MENU
 # =========================
-def main_menu() -> ReplyKeyboardMarkup:
+def main_menu(chat_id: int) -> ReplyKeyboardMarkup:
+    L = lang_of(chat_id)
+    lang_btn = t(chat_id, "btn_lang_en") if L == "EN" else t(chat_id, "btn_lang_ru")
+
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="1) Send for review (screenshot/link)")],
-            [KeyboardButton(text="2) How it works?")],
-            [KeyboardButton(text="3) Design channel @prodooktovy")],
+            [KeyboardButton(text=t(chat_id, "btn_send"))],
+            [KeyboardButton(text=t(chat_id, "btn_how"))],
+            [KeyboardButton(text=t(chat_id, "btn_channel"))],
+            [KeyboardButton(text=lang_btn)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -117,33 +234,65 @@ def cancel_keyboard() -> InlineKeyboardMarkup:
 
 
 # =========================
-# ASCII ANIMATION (KEEP IT FUN, NOT HUGE)
+# MarkdownV2 helpers (for monospace blocks)
+# =========================
+def md2_escape_outside_code(s: str) -> str:
+    # We avoid using MarkdownV2 for normal text; only for code blocks.
+    # Still, keep a minimal escape if needed.
+    to_escape = r"_*[]()~`>#+-=|{}.!"
+    out = ""
+    for ch in s:
+        if ch in to_escape:
+            out += "\\" + ch
+        else:
+            out += ch
+    return out
+
+
+def md2_codeblock(text: str, lang: str = "text") -> str:
+    # Inside code block, only backticks can break it.
+    safe = text.replace("```", "'''" )
+    return f"```{lang}\n{safe}\n```"
+
+
+# =========================
+# ASCII ANIMATION (compact, dynamic, monospace)
 # =========================
 SPIN = ["|", "/", "-", "\\"]
+PAT = ["░", "▒", "▓", "█"]
 
 def ascii_frame(step: int, title: str) -> str:
-    # compact retro block
-    bar_w = 22
+    bar_w = 24
     fill = step % (bar_w + 1)
-    bar = "[" + ("#" * fill) + ("." * (bar_w - fill)) + "]"
+    # little shimmer effect
+    shimmer = PAT[(step // 2) % len(PAT)]
+    bar = "[" + (shimmer * fill) + (" " * (bar_w - fill)) + "]"
+    # keep title short to prevent Telegram edits failing
+    title = title[:28]
     return f"{SPIN[step % 4]} {title}\n{bar}"
 
 
-async def safe_edit(msg: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> Message:
+async def safe_edit_code(msg: Message, content: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> Message:
     try:
-        return await msg.edit_text(text, reply_markup=reply_markup)
+        return await msg.edit_text(
+            md2_codeblock(content, "text"),
+            parse_mode=ParseMode.MARKDOWN_V2,
+            reply_markup=reply_markup,
+        )
     except Exception:
         return msg
 
 
 async def animate_progress(anchor: Message, title: str, done_evt: asyncio.Event, cancel_markup: InlineKeyboardMarkup) -> Message:
-    # Send first message with cancel button
-    m = await anchor.answer(f"```text\n{ascii_frame(0, title)}\n```", reply_markup=cancel_markup)
+    m = await anchor.answer(
+        md2_codeblock(ascii_frame(0, title), "text"),
+        parse_mode=ParseMode.MARKDOWN_V2,
+        reply_markup=cancel_markup,
+    )
     step = 1
     while not done_evt.is_set():
-        await asyncio.sleep(0.18)
-        # keep updating while allowed
-        await safe_edit(m, f"```text\n{ascii_frame(step, title)}\n```", reply_markup=cancel_markup)
+        await asyncio.sleep(0.16)
+        await safe_edit_code(m, ascii_frame(step, title), reply_markup=cancel_markup)
         step += 1
     return m
 
@@ -164,13 +313,11 @@ def looks_like_figma_url(s: str) -> bool:
 
 
 def normalize_figma_url(url: str) -> str:
-    # Keep node-id & other params intact; just strip whitespace
     return url.strip()
 
 
 def pil_open_image(img_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(img_bytes))
-    # Convert to RGB for drawing + OCR
     if img.mode not in ("RGB", "RGBA"):
         img = img.convert("RGB")
     if img.mode == "RGBA":
@@ -180,14 +327,12 @@ def pil_open_image(img_bytes: bytes) -> Image.Image:
     return img
 
 
-def download_url_bytes(url: str, max_bytes: int) -> Optional[bytes]:
+def download_url_bytes(url: str, max_bytes: int, timeout_s: int) -> Optional[bytes]:
     req = urllib.request.Request(
         url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (DesignReviewerBot/1.0)"
-        }
+        headers={"User-Agent": "Mozilla/5.0 (DesignReviewerBot/1.0)"}
     )
-    with urllib.request.urlopen(req, timeout=FIGMA_DOWNLOAD_TIMEOUT) as r:
+    with urllib.request.urlopen(req, timeout=timeout_s) as r:
         data = r.read(max_bytes + 1)
         if len(data) > max_bytes:
             return None
@@ -208,45 +353,9 @@ def figma_oembed(figma_url: str) -> Optional[Dict[str, Any]]:
 # =========================
 # OCR
 # =========================
-def extract_ocr_blocks(img: Image.Image) -> List[Dict[str, Any]]:
-    # Use image_to_data to get boxes
-    data = pytesseract.image_to_data(img, lang=OCR_LANG, output_type=pytesseract.Output.DICT)
-    n = len(data.get("text", []))
-    blocks: List[Dict[str, Any]] = []
-
-    for i in range(n):
-        txt = (data["text"][i] or "").strip()
-        try:
-            conf = float(data["conf"][i])
-        except Exception:
-            conf = -1.0
-        if not txt:
-            continue
-        # Heuristic: ignore garbage / ultra-low confidence
-        if conf != -1.0 and conf < 35:
-            continue
-
-        x, y, w, h = int(data["left"][i]), int(data["top"][i]), int(data["width"][i]), int(data["height"][i])
-        blocks.append({
-            "id": i,
-            "text": txt,
-            "conf": conf,
-            "bbox": [x, y, w, h],
-            "line": int(data.get("line_num", [0]*n)[i]) if "line_num" in data else 0,
-            "block": int(data.get("block_num", [0]*n)[i]) if "block_num" in data else 0,
-            "par": int(data.get("par_num", [0]*n)[i]) if "par_num" in data else 0,
-        })
-
-    # Merge words into line chunks
-    merged = merge_blocks_to_lines(blocks)
-    return merged
-
-
 def merge_blocks_to_lines(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not words:
         return []
-
-    # Group by (block, par, line)
     groups: Dict[Tuple[int, int, int], List[Dict[str, Any]]] = {}
     for w in words:
         key = (w.get("block", 0), w.get("par", 0), w.get("line", 0))
@@ -265,17 +374,36 @@ def merge_blocks_to_lines(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         bbox = [min(xs), min(ys), max(x2) - min(xs), max(y2) - min(ys)]
         confs = [it.get("conf", -1.0) for it in items if isinstance(it.get("conf", None), (int, float))]
         conf_avg = sum(confs) / max(1, len(confs))
-        word_ids = [it["id"] for it in items]
-        lines.append({
-            "text": text,
-            "bbox": bbox,
-            "conf": conf_avg,
-            "word_ids": word_ids,
-        })
+        lines.append({"text": text, "bbox": bbox, "conf": conf_avg})
 
-    # Sort top-to-bottom
     lines.sort(key=lambda z: (z["bbox"][1], z["bbox"][0]))
     return lines
+
+
+def extract_ocr_lines(img: Image.Image) -> List[Dict[str, Any]]:
+    data = pytesseract.image_to_data(img, lang=OCR_LANG, output_type=pytesseract.Output.DICT)
+    n = len(data.get("text", []))
+    words: List[Dict[str, Any]] = []
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        try:
+            conf = float(data["conf"][i])
+        except Exception:
+            conf = -1.0
+        if not txt:
+            continue
+        if conf != -1.0 and conf < 35:
+            continue
+        x, y, w, h = int(data["left"][i]), int(data["top"][i]), int(data["width"][i]), int(data["height"][i])
+        words.append({
+            "text": txt,
+            "conf": conf,
+            "bbox": [x, y, w, h],
+            "line": int(data.get("line_num", [0]*n)[i]) if "line_num" in data else 0,
+            "block": int(data.get("block_num", [0]*n)[i]) if "block_num" in data else 0,
+            "par": int(data.get("par_num", [0]*n)[i]) if "par_num" in data else 0,
+        })
+    return merge_blocks_to_lines(words)
 
 
 # =========================
@@ -285,31 +413,26 @@ def draw_annotations(img_bytes: bytes, lines: List[Dict[str, Any]], issues: List
     img = pil_open_image(img_bytes)
     draw = ImageDraw.Draw(img)
 
-    # Font (optional)
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 20)
     except Exception:
         font = ImageFont.load_default()
 
-    # We annotate by "target_index" (line index in OCR lines)
     for k, iss in enumerate(issues, start=1):
         idx = iss.get("target_index", None)
-        if idx is None:
-            continue
         if not isinstance(idx, int):
             continue
         if idx < 0 or idx >= len(lines):
             continue
-
         x, y, w, h = lines[idx]["bbox"]
-        # Draw rectangle (thick-ish)
         for t in range(3):
             draw.rectangle([x - t, y - t, x + w + t, y + h + t], outline=(0, 0, 0))
-        # Number label (small filled box)
+
         label = str(k)
         lx = clamp(x - 6, 0, img.size[0]-1)
         ly = clamp(y - 28, 0, img.size[1]-1)
-        tw, th = draw.textbbox((0, 0), label, font=font)[2:]
+        bb = draw.textbbox((0, 0), label, font=font)
+        tw, th = bb[2] - bb[0], bb[3] - bb[1]
         pad = 6
         draw.rectangle([lx, ly, lx + tw + pad*2, ly + th + pad*2], fill=(255, 255, 255), outline=(0, 0, 0))
         draw.text((lx + pad, ly + pad), label, fill=(0, 0, 0), font=font)
@@ -320,10 +443,9 @@ def draw_annotations(img_bytes: bytes, lines: List[Dict[str, Any]], issues: List
 
 
 # =========================
-# LLM (ONE CALL) + FALLBACK
+# LLM + FALLBACK
 # =========================
 def extract_first_json(text: str) -> Optional[Dict[str, Any]]:
-    # try find first { ... } block
     m = re.search(r"\{[\s\S]*\}", text)
     if not m:
         return None
@@ -334,28 +456,149 @@ def extract_first_json(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def call_llm_review(img_bytes: bytes, lines: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # If no OpenAI or disabled -> heuristic fallback
-    if not LLM_ENABLED or not OPENAI_API_KEY or OpenAI is None:
-        return heuristic_review(lines)
+def default_ascii_concept() -> str:
+    return "\n".join([
+        "+--------------------------------------+",
+        "|  Title                                |",
+        "|  Short explanation                    |",
+        "|                                      |",
+        "|  [ Primary action ]                   |",
+        "|  [ Secondary ]                        |",
+        "|                                      |",
+        "|  Hint / helper text                   |",
+        "+--------------------------------------+",
+    ])
+
+
+def trim_ascii(s: str, max_lines: int = 18, max_width: int = 52) -> str:
+    lines = s.splitlines()[:max_lines]
+    lines = [ln[:max_width] for ln in lines]
+    return "\n".join(lines).strip()
+
+
+def heuristic_review(lines: List[Dict[str, Any]], chat_id: int, note: str = "") -> Dict[str, Any]:
+    all_text = " ".join([l["text"] for l in lines]).lower()
+    praise, ux, tx, issues = [], [], [], []
+
+    if len(lines) >= 3:
+        praise.append("There’s some structure on the screen — it doesn’t look like pure chaos.")
+
+    if "error" in all_text or "ошиб" in all_text:
+        tx.append("If there’s an error, make it concrete: what happened + what to do next.")
+
+    ux.append("Check visual hierarchy: one primary focus, everything else supports it.")
+    ux.append("If there’s too much text, compress into: title + 1–2 lines, then details if needed.")
+
+    if lines:
+        issues.append({
+            "target_index": 0,
+            "title": "Too generic",
+            "problem": "Text feels vague — user may not understand what happens next.",
+            "fix": "Rewrite as fact + next step: “We did X. Result Y. Next: go to Z.”",
+            "severity": "medium",
+        })
+
+    if note:
+        tx.append(note)
+
+    what_i_see = "I see a UI screen with text elements and controls. Without LLM, I can only give general feedback."
+    score = 6
+
+    if lang_of(chat_id) == "RU":
+        what_i_see = "Вижу экран UI с текстовыми элементами и контролами. Без LLM могу дать только общее ревью."
+        score = 6
+
+    return {
+        "what_i_see": what_i_see,
+        "score": score,
+        "verdict": {"ux": ux, "text": tx, "praise": praise},
+        "issues": issues,
+        "concept_ascii": default_ascii_concept(),
+    }
+
+
+def normalize_llm_output(d: Dict[str, Any], lines: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    out["what_i_see"] = str(d.get("what_i_see", "")).strip()
+
+    try:
+        sc = int(d.get("score", 0))
+    except Exception:
+        sc = 0
+    out["score"] = clamp(sc, 0, 10)
+
+    verdict = d.get("verdict", {}) if isinstance(d.get("verdict", {}), dict) else {}
+    out["verdict"] = {
+        "ux": [str(x).strip() for x in (verdict.get("ux", []) or [])][:12],
+        "text": [str(x).strip() for x in (verdict.get("text", []) or [])][:12],
+        "praise": [str(x).strip() for x in (verdict.get("praise", []) or [])][:12],
+    }
+
+    issues_in = d.get("issues", []) if isinstance(d.get("issues", []), list) else []
+    issues: List[Dict[str, Any]] = []
+    for it in issues_in[:20]:
+        if not isinstance(it, dict):
+            continue
+        idx = it.get("target_index", None)
+        if isinstance(idx, int) and 0 <= idx < len(lines):
+            pass
+        else:
+            idx = None
+        sev = str(it.get("severity", "medium")).lower().strip()
+        if sev not in ("low", "medium", "high"):
+            sev = "medium"
+        issues.append({
+            "target_index": idx,
+            "title": str(it.get("title", "")).strip(),
+            "problem": str(it.get("problem", "")).strip(),
+            "fix": str(it.get("fix", "")).strip(),
+            "severity": sev,
+        })
+    out["issues"] = issues
+
+    concept = str(d.get("concept_ascii", "")).rstrip()
+    if not concept:
+        concept = default_ascii_concept()
+    out["concept_ascii"] = trim_ascii(concept)
+
+    return out
+
+
+def call_llm_review(img_bytes: bytes, lines: List[Dict[str, Any]], chat_id: int) -> Dict[str, Any]:
+    # Strong diagnostics + safe fallback
+    if not LLM_ENABLED:
+        return heuristic_review(lines, chat_id, note=t(chat_id, "llm_disabled"))
+    if not OPENAI_API_KEY:
+        return heuristic_review(lines, chat_id, note=t(chat_id, "llm_missing_key"))
+    if OpenAI is None:
+        return heuristic_review(lines, chat_id, note=t(chat_id, "llm_sdk_missing"))
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    # Prepare OCR summary for the model (limited)
     ocr_list = []
     for i, ln in enumerate(lines[:80]):
         ocr_list.append({"i": i, "text": ln["text"]})
 
+    # All instructions in EN by default; RU mode asks it to answer in RU.
+    if lang_of(chat_id) == "RU":
+        lang_instr = "Write all fields in Russian."
+    else:
+        lang_instr = "Write all fields in English."
+
     prompt = f"""
 You are a strict-but-fair senior product designer reviewing a UI screenshot.
 
-Rules:
-- Be blunt, no insults, no profanity.
-- If something is good, praise it with specifics.
-- For fonts/palette: only GUESS font family vibes (e.g., "Inter-like", "SF Pro-like"). No sizes, no numeric colors.
-- Output must be understandable and actionable: always say what is wrong AND what to do instead.
+Tone:
+- Be blunt and specific, but no insults and no profanity.
+- Praise with specifics when deserved.
+
+Constraints:
+- Fonts/palette: only GUESS font family vibe (e.g., "Inter-like", "SF Pro-like"). No sizes, no numeric colors.
+- Always say what is wrong AND what to do instead.
 - Score 0..10 (integer).
-- Give issues that map to OCR line indices when possible.
+- Issues should map to OCR line indices when possible.
+
+{lang_instr}
 
 Return JSON (no markdown) in this exact shape:
 {{
@@ -385,156 +628,46 @@ OCR lines (index -> text):
     img_b64 = base64.b64encode(img_bytes).decode("utf-8")
     data_url = "data:image/png;base64," + img_b64
 
-    # Responses API content types MUST be input_text / input_image
-    resp = client.responses.create(
-        model=LLM_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt},
-                    {"type": "input_image", "image_url": data_url},
-                ],
-            }
-        ],
-    )
-
-    text = getattr(resp, "output_text", None) or ""
-    parsed = extract_first_json(text)
-    if not parsed:
-        # fallback: try use raw text
-        return heuristic_review(lines, note="LLM returned non-JSON; used fallback.")
-
-    # sanitize
-    return normalize_llm_output(parsed, lines)
-
-
-def normalize_llm_output(d: Dict[str, Any], lines: List[Dict[str, Any]]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    out["what_i_see"] = str(d.get("what_i_see", "")).strip()
-    # score
     try:
-        sc = int(d.get("score", 0))
-    except Exception:
-        sc = 0
-    out["score"] = clamp(sc, 0, 10)
-
-    verdict = d.get("verdict", {}) if isinstance(d.get("verdict", {}), dict) else {}
-    out["verdict"] = {
-        "ux": [str(x).strip() for x in (verdict.get("ux", []) or [])][:12],
-        "text": [str(x).strip() for x in (verdict.get("text", []) or [])][:12],
-        "praise": [str(x).strip() for x in (verdict.get("praise", []) or [])][:12],
-    }
-
-    issues_in = d.get("issues", []) if isinstance(d.get("issues", []), list) else []
-    issues: List[Dict[str, Any]] = []
-    for it in issues_in[:20]:
-        if not isinstance(it, dict):
-            continue
-        idx = it.get("target_index", None)
-        if isinstance(idx, int) and 0 <= idx < len(lines):
-            pass
-        else:
-            # allow None
-            idx = None
-        sev = str(it.get("severity", "medium")).lower().strip()
-        if sev not in ("low", "medium", "high"):
-            sev = "medium"
-        issues.append({
-            "target_index": idx,
-            "title": str(it.get("title", "")).strip(),
-            "problem": str(it.get("problem", "")).strip(),
-            "fix": str(it.get("fix", "")).strip(),
-            "severity": sev,
-        })
-    out["issues"] = issues
-
-    concept = str(d.get("concept_ascii", "")).rstrip()
-    if not concept:
-        concept = default_ascii_concept()
-    out["concept_ascii"] = trim_ascii(concept, max_lines=18, max_width=48)
-
-    return out
-
-
-def trim_ascii(s: str, max_lines: int, max_width: int) -> str:
-    lines = s.splitlines()
-    lines = lines[:max_lines]
-    lines = [ln[:max_width] for ln in lines]
-    return "\n".join(lines).strip()
-
-
-def default_ascii_concept() -> str:
-    return "\n".join([
-        "+--------------------------------------+",
-        "|  Title                                |",
-        "|  Short explanation                    |",
-        "|                                      |",
-        "|  [ Primary action ]                   |",
-        "|  [ Secondary ]                        |",
-        "|                                      |",
-        "|  Hint / helper text                   |",
-        "+--------------------------------------+",
-    ])
-
-
-def heuristic_review(lines: List[Dict[str, Any]], note: str = "") -> Dict[str, Any]:
-    # Basic, but not useless: give something actionable.
-    all_text = " ".join([l["text"] for l in lines]).lower()
-    praise = []
-    ux = []
-    tx = []
-    issues = []
-
-    if len(lines) >= 3:
-        praise.append("Есть структурированные текстовые блоки — экран, вероятно, не «каша».")
-
-    if any("успеш" in all_text for _ in [0]):
-        tx.append("Слово «успешно» часто раздувает статус. Лучше писать факт: «Отправили», «Создали», «Готово».")
-
-    if any("ошиб" in all_text for _ in [0]):
-        tx.append("Если есть ошибка — добавь конкретику: что случилось и что делать дальше (следующий шаг).")
-
-    ux.append("Проверь визуальную иерархию: один главный акцент, остальное — поддержка.")
-    ux.append("Если на экране много текста — сделай короткий заголовок + 1–2 строки, остальное в детали.")
-
-    # Make a couple issues mapped to first lines (if any)
-    if lines:
-        issues.append({
-            "target_index": 0,
-            "title": "Слишком расплывчато",
-            "problem": "Текст звучит общо — пользователь может не понять, что произойдёт дальше.",
-            "fix": "Перепиши как факт + следующий шаг: «Мы делаем X. Результат будет Y. Проверить в разделе Z».",
-            "severity": "medium",
-        })
-
-    if note:
-        tx.append(note)
-
-    return {
-        "what_i_see": "Вижу экран интерфейса с текстовыми элементами. Без LLM могу оценить только общие риски.",
-        "score": 6,
-        "verdict": {"ux": ux, "text": tx, "praise": praise},
-        "issues": issues,
-        "concept_ascii": default_ascii_concept(),
-    }
+        # Responses API content types: input_text / input_image
+        resp = client.responses.create(
+            model=LLM_MODEL,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url},
+                    ],
+                }
+            ],
+        )
+        text = getattr(resp, "output_text", None) or ""
+        parsed = extract_first_json(text)
+        if not parsed:
+            return heuristic_review(lines, chat_id, note="LLM returned non-JSON; fallback used.")
+        return normalize_llm_output(parsed, lines)
+    except Exception as e:
+        # Print to logs (Railway)
+        print("LLM ERROR:", repr(e))
+        return heuristic_review(lines, chat_id, note=t(chat_id, "llm_error_prefix") + str(e))
 
 
 # =========================
-# FORMATTING (NO HTML, NO TAGS)
+# FORMATTING (plain text, no HTML; monospace only for code blocks)
 # =========================
 def fmt_bullets(items: List[str], prefix: str = "- ") -> str:
     return "\n".join([prefix + x for x in items if x.strip()])
 
 
-def format_what_i_see(r: Dict[str, Any]) -> str:
+def format_what_i_see(r: Dict[str, Any], chat_id: int) -> str:
     s = (r.get("what_i_see") or "").strip()
     if not s:
         s = "I see a UI screen with text blocks and interface controls."
-    return s
+    return f"{t(chat_id, 'what_i_see')}\n{s}"
 
 
-def format_verdict(r: Dict[str, Any]) -> str:
+def format_verdict(r: Dict[str, Any], chat_id: int) -> str:
     score = r.get("score", 0)
     v = r.get("verdict", {}) if isinstance(r.get("verdict", {}), dict) else {}
     ux = v.get("ux", []) if isinstance(v.get("ux", []), list) else []
@@ -542,48 +675,41 @@ def format_verdict(r: Dict[str, Any]) -> str:
     pr = v.get("praise", []) if isinstance(v.get("praise", []), list) else []
 
     parts = []
-    parts.append(f"VERDICT: {score}/10")
-    if pr:
-        parts.append("\nGOOD (keep it):\n" + fmt_bullets(pr))
-    if ux:
-        parts.append("\nUX (fix it):\n" + fmt_bullets(ux))
-    if tx:
-        parts.append("\nTEXT (fix it):\n" + fmt_bullets(tx))
+    parts.append(f"{t(chat_id, 'verdict_title')} {score}/10")
 
-    # Issues list (numbered)
+    if pr:
+        parts.append("\n" + t(chat_id, "good") + "\n" + fmt_bullets(pr))
+    if ux:
+        parts.append("\n" + t(chat_id, "ux") + "\n" + fmt_bullets(ux))
+    if tx:
+        parts.append("\n" + t(chat_id, "text") + "\n" + fmt_bullets(tx))
+
     issues = r.get("issues", []) if isinstance(r.get("issues", []), list) else []
     if issues:
-        lines = []
+        lines_out = []
         for i, it in enumerate(issues[:12], start=1):
             title = (it.get("title") or "Issue").strip()
             sev = (it.get("severity") or "medium").strip().lower()
             problem = (it.get("problem") or "").strip()
             fix = (it.get("fix") or "").strip()
-            lines.append(f"{i}) [{sev}] {title}\n   - Problem: {problem}\n   - Fix: {fix}")
-        parts.append("\nCALLOUTS:\n" + "\n".join(lines))
+            lines_out.append(f"{i}) [{sev}] {title}\n   - Problem: {problem}\n   - Fix: {fix}")
+        parts.append("\n" + t(chat_id, "callouts") + "\n" + "\n".join(lines_out))
 
     return "\n".join(parts).strip()
 
 
-def format_ascii_concept(r: Dict[str, Any]) -> str:
-    s = (r.get("concept_ascii") or "").rstrip()
-    if not s:
-        s = default_ascii_concept()
-    return s
-
-
 # =========================
-# CORE PROCESSING (CANCEL + NO MENU SPAM)
+# CORE PROCESSING (CANCEL + MENU POLICY)
 # =========================
 async def ocr_lines_async(img: Image.Image) -> List[Dict[str, Any]]:
-    return await asyncio.to_thread(extract_ocr_blocks, img)
+    return await asyncio.to_thread(extract_ocr_lines, img)
 
 
-async def llm_review_async(img_bytes: bytes, lines: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return await asyncio.to_thread(call_llm_review, img_bytes, lines)
+async def llm_review_async(img_bytes: bytes, lines: List[Dict[str, Any]], chat_id: int) -> Dict[str, Any]:
+    return await asyncio.to_thread(call_llm_review, img_bytes, lines, chat_id)
 
 
-async def process_image_review(anchor: Message, img_bytes: bytes, source_label: str = "Screenshot") -> None:
+async def process_image_review(anchor: Message, img_bytes: bytes, source_label: str = "SCREEN") -> None:
     chat_id = anchor.chat.id
     cancel_evt = asyncio.Event()
     active_reviews[chat_id] = cancel_evt
@@ -596,7 +722,6 @@ async def process_image_review(anchor: Message, img_bytes: bytes, source_label: 
     try:
         img = pil_open_image(img_bytes)
 
-        # OCR
         if cancel_evt.is_set():
             raise asyncio.CancelledError()
 
@@ -605,8 +730,7 @@ async def process_image_review(anchor: Message, img_bytes: bytes, source_label: 
         if cancel_evt.is_set():
             raise asyncio.CancelledError()
 
-        # LLM review (optional)
-        review = await asyncio.wait_for(llm_review_async(img_bytes, lines), timeout=LLM_TIMEOUT)
+        review = await asyncio.wait_for(llm_review_async(img_bytes, lines, chat_id), timeout=LLM_TIMEOUT)
 
         if cancel_evt.is_set():
             raise asyncio.CancelledError()
@@ -617,8 +741,7 @@ async def process_image_review(anchor: Message, img_bytes: bytes, source_label: 
             await spinner_task
         except Exception:
             pass
-        # end with menu
-        await anchor.answer("Cancelled. Send another screenshot or a public Figma frame link.", reply_markup=main_menu())
+        await anchor.answer(t(chat_id, "cancelled"), reply_markup=main_menu(chat_id))
         return
 
     except asyncio.TimeoutError:
@@ -627,10 +750,7 @@ async def process_image_review(anchor: Message, img_bytes: bytes, source_label: 
             await spinner_task
         except Exception:
             pass
-        await anchor.answer(
-            "Timed out. Send the same screen again (preferably larger / clearer).",
-            reply_markup=main_menu(),
-        )
+        await anchor.answer(t(chat_id, "timeout"), reply_markup=main_menu(chat_id))
         return
 
     except Exception as e:
@@ -639,7 +759,7 @@ async def process_image_review(anchor: Message, img_bytes: bytes, source_label: 
             await spinner_task
         except Exception:
             pass
-        await anchor.answer(f"Processing failed: {str(e)}", reply_markup=main_menu())
+        await anchor.answer(t(chat_id, "processing_failed") + str(e), reply_markup=main_menu(chat_id))
         return
 
     finally:
@@ -648,41 +768,45 @@ async def process_image_review(anchor: Message, img_bytes: bytes, source_label: 
             await spinner_task
         except Exception:
             pass
-        # clear active review
-        if chat_id in active_reviews:
-            del active_reviews[chat_id]
+        active_reviews.pop(chat_id, None)
 
-    # 1) what i see (NO menu)
-    await anchor.answer("WHAT I SEE:\n" + format_what_i_see(review))
+    # 1) What I see (no menu)
+    await anchor.answer(format_what_i_see(review, chat_id))
 
-    # 2) verdict + recommendations (NO menu)
-    await anchor.answer(format_verdict(review))
+    # 2) Verdict (no menu)
+    await anchor.answer(format_verdict(review, chat_id))
 
-    # 3) annotated screenshot (NO menu)
+    # 3) Annotated screenshot (no menu)
     try:
         annotated = await asyncio.to_thread(draw_annotations, img_bytes, lines, review.get("issues", []))
         await anchor.answer_photo(
             BufferedInputFile(annotated, filename="annotated.png"),
-            caption="ANNOTATIONS: numbers match CALLOUTS list above.",
+            caption=t(chat_id, "annotations_caption"),
         )
     except Exception:
-        await anchor.answer("Annotations failed this time. The written feedback still applies.")
+        await anchor.answer(t(chat_id, "annot_fail"))
 
-    # extra retro spinner before concept (small)
+    # Short retro intermission (keeps style, not huge)
     done2 = asyncio.Event()
     spinner2 = asyncio.create_task(animate_progress(anchor, "CONCEPT", done2, cancel_keyboard()))
-    await asyncio.sleep(0.9)
+    await asyncio.sleep(0.75)
     done2.set()
     try:
         await spinner2
     except Exception:
         pass
 
-    # 4) concept (NO menu)
-    await anchor.answer("CONCEPT (ASCII):\n```text\n" + format_ascii_concept(review) + "\n```")
+    # 4) Concept (monospace)
+    concept = review.get("concept_ascii") or default_ascii_concept()
+    concept = trim_ascii(str(concept))
 
-    # end with menu (ONLY HERE)
-    await anchor.answer("Done. Send another screenshot or a public Figma frame link.", reply_markup=main_menu())
+    await anchor.answer(
+        t(chat_id, "concept_title") + "\n" + md2_codeblock(concept, "text"),
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+
+    # menu only at the end
+    await anchor.answer(t(chat_id, "done"), reply_markup=main_menu(chat_id))
 
 
 async def process_figma_link(anchor: Message, url: str) -> None:
@@ -705,15 +829,17 @@ async def process_figma_link(anchor: Message, url: str) -> None:
         if not o:
             raise RuntimeError("Figma oEmbed returned empty.")
 
-        thumb = o.get("thumbnail_url") or o.get("thumbnail") or ""
-        title = (o.get("title") or "Figma frame").strip()
+        thumb = o.get("thumbnail_url") or ""
         if not thumb:
             raise RuntimeError("No thumbnail_url from Figma. Make sure the file is public.")
 
         if cancel_evt.is_set():
             raise asyncio.CancelledError()
 
-        img_bytes = await asyncio.wait_for(asyncio.to_thread(download_url_bytes, thumb, MAX_PREVIEW_BYTES), timeout=FIGMA_DOWNLOAD_TIMEOUT)
+        img_bytes = await asyncio.wait_for(
+            asyncio.to_thread(download_url_bytes, thumb, MAX_PREVIEW_BYTES, FIGMA_DOWNLOAD_TIMEOUT),
+            timeout=FIGMA_DOWNLOAD_TIMEOUT
+        )
         if not img_bytes:
             raise RuntimeError("Failed to download preview (too large / blocked).")
 
@@ -723,7 +849,7 @@ async def process_figma_link(anchor: Message, url: str) -> None:
             await spinner_task
         except Exception:
             pass
-        await anchor.answer("Cancelled.", reply_markup=main_menu())
+        await anchor.answer(t(chat_id, "cancelled"), reply_markup=main_menu(chat_id))
         return
     except asyncio.TimeoutError:
         done_evt.set()
@@ -731,7 +857,7 @@ async def process_figma_link(anchor: Message, url: str) -> None:
             await spinner_task
         except Exception:
             pass
-        await anchor.answer("Figma fetch timed out. Try again.", reply_markup=main_menu())
+        await anchor.answer(t(chat_id, "fetch_timeout"), reply_markup=main_menu(chat_id))
         return
     except Exception as e:
         done_evt.set()
@@ -739,7 +865,7 @@ async def process_figma_link(anchor: Message, url: str) -> None:
             await spinner_task
         except Exception:
             pass
-        await anchor.answer(f"Could not fetch Figma preview: {str(e)}", reply_markup=main_menu())
+        await anchor.answer(t(chat_id, "fetch_failed") + str(e), reply_markup=main_menu(chat_id))
         return
     finally:
         done_evt.set()
@@ -747,17 +873,15 @@ async def process_figma_link(anchor: Message, url: str) -> None:
             await spinner_task
         except Exception:
             pass
-        if chat_id in active_reviews:
-            del active_reviews[chat_id]
+        active_reviews.pop(chat_id, None)
 
-    # Show the preview image (proof we fetched the correct node)
+    # Show preview so user knows we fetched correct node
     await anchor.answer_photo(
         BufferedInputFile(img_bytes, filename="figma_preview.png"),
-        caption="Figma preview fetched. Reviewing now...",
+        caption=t(chat_id, "figma_preview_caption"),
     )
 
-    # Now run normal image review pipeline
-    await process_image_review(anchor, img_bytes, source_label="Figma")
+    await process_image_review(anchor, img_bytes, source_label="FIGMA")
 
 
 # =========================
@@ -765,14 +889,12 @@ async def process_figma_link(anchor: Message, url: str) -> None:
 # =========================
 @router.message(Command("start"))
 async def on_start(m: Message):
-    text = (
-        "Design Reviewer.\n\n"
-        "I accept for review:\n"
-        "- screenshots (images)\n"
-        "- public Figma frame links (if the file is public)\n\n"
-        "Use the menu or just send a screenshot/link."
+    chat_id = m.chat.id
+    chat_lang.setdefault(chat_id, "EN")
+    await m.answer(
+        f"{t(chat_id, 'start_title')}\n\n{t(chat_id, 'start_body')}",
+        reply_markup=main_menu(chat_id)
     )
-    await m.answer(text, reply_markup=main_menu())
 
 
 @router.callback_query(F.data == BTN_CANCEL)
@@ -782,7 +904,6 @@ async def on_cancel(cb: CallbackQuery):
         evt = active_reviews.get(chat_id)
         if evt:
             evt.set()
-    # Try to edit the spinner message (best effort)
     try:
         if cb.message:
             await cb.message.edit_text("Cancelling…")
@@ -791,57 +912,74 @@ async def on_cancel(cb: CallbackQuery):
     await cb.answer("Cancelled")
 
 
-@router.message(F.text == "2) How it works?")
-async def on_help(m: Message):
-    await m.answer(
-        "How it works:\n"
-        "1) Send a screenshot OR a public Figma frame link\n"
-        "2) I analyze what’s on screen\n"
-        "3) You get: what I see + verdict + annotations + ASCII concept\n\n"
-        "Tip: clearer screenshots = better feedback.",
-        # no menu spam; keep menu already visible from /start
-    )
+@router.message(F.text)
+async def on_text(m: Message):
+    chat_id = m.chat.id
+    txt = (m.text or "").strip()
 
+    # Language toggle button
+    if txt == t(chat_id, "btn_lang_en") or txt == t(chat_id, "btn_lang_ru"):
+        chat_lang[chat_id] = "RU" if lang_of(chat_id) == "EN" else "EN"
+        await m.answer(
+            "OK." if lang_of(chat_id) == "EN" else "Ок.",
+            reply_markup=main_menu(chat_id)
+        )
+        return
 
-@router.message(F.text == "3) Design channel @prodooktovy")
-async def on_channel(m: Message):
-    # Telegram doesn't allow "subscribe" button universally; simplest is link button
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Open @prodooktovy", url="https://t.me/prodooktovy")]
-        ]
-    )
-    await m.answer("Design channel:", reply_markup=kb)
+    # Menu buttons
+    if txt == t(chat_id, "btn_how"):
+        await m.answer(t(chat_id, "how"))
+        return
 
+    if txt == t(chat_id, "btn_send"):
+        await m.answer(t(chat_id, "send_hint"))
+        return
 
-@router.message(F.text == "1) Send for review (screenshot/link)")
-async def on_send_for_review_hint(m: Message):
-    await m.answer("Send a screenshot image or paste a public Figma frame link.")
+    if txt == t(chat_id, "btn_channel"):
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="Open @prodooktovy", url="https://t.me/prodooktovy")]]
+        )
+        await m.answer(t(chat_id, "channel"), reply_markup=kb)
+        return
+
+    # Figma link
+    if looks_like_figma_url(txt):
+        await process_figma_link(m, txt)
+        return
+
+    # Other URL
+    if is_probably_url(txt):
+        await m.answer(t(chat_id, "figma_bad_link"), reply_markup=main_menu(chat_id))
+        return
+
+    # Random text
+    await m.answer(t(chat_id, "text_alone"))
 
 
 @router.message(F.content_type == ContentType.PHOTO)
 async def on_photo(m: Message, bot: Bot):
-    # Take the biggest photo
+    chat_id = m.chat.id
     ph = m.photo[-1]
     file = await bot.get_file(ph.file_id)
     buf = io.BytesIO()
     await bot.download_file(file.file_path, destination=buf)
     img_bytes = buf.getvalue()
     if len(img_bytes) > MAX_IMAGE_BYTES:
-        await m.answer("Image too large. Send a smaller screenshot.", reply_markup=main_menu())
+        await m.answer(t(chat_id, "img_too_large"), reply_markup=main_menu(chat_id))
         return
-    await process_image_review(m, img_bytes, source_label="Screenshot")
+    await process_image_review(m, img_bytes, source_label="SCREEN")
 
 
 @router.message(F.content_type == ContentType.DOCUMENT)
 async def on_document(m: Message, bot: Bot):
-    # Accept only images as documents
+    chat_id = m.chat.id
     doc = m.document
     if not doc:
         return
     mime = (doc.mime_type or "").lower()
-    if not (mime.startswith("image/") or doc.file_name.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):
-        await m.answer("Send an image file (PNG/JPG) or a Figma link.", reply_markup=main_menu())
+    name = (doc.file_name or "").lower()
+    if not (mime.startswith("image/") or name.endswith((".png", ".jpg", ".jpeg", ".webp"))):
+        await m.answer(t(chat_id, "doc_need_img"), reply_markup=main_menu(chat_id))
         return
 
     file = await bot.get_file(doc.file_id)
@@ -849,53 +987,29 @@ async def on_document(m: Message, bot: Bot):
     await bot.download_file(file.file_path, destination=buf)
     img_bytes = buf.getvalue()
     if len(img_bytes) > MAX_IMAGE_BYTES:
-        await m.answer("Image too large. Send a smaller screenshot.", reply_markup=main_menu())
+        await m.answer(t(chat_id, "img_too_large"), reply_markup=main_menu(chat_id))
         return
-    await process_image_review(m, img_bytes, source_label="Screenshot")
-
-
-@router.message(F.text)
-async def on_text(m: Message):
-    t = (m.text or "").strip()
-    if looks_like_figma_url(t) and looks_like_figma_url(t):
-        await process_figma_link(m, t)
-        return
-
-    # If user pasted other links or text
-    if is_probably_url(t):
-        await m.answer(
-            "I can review:\n- screenshots (images)\n- public Figma frame links (file must be public)\n\n"
-            "Send a screenshot or a Figma link with node-id.",
-            # keep menu only if we need to recover the UI
-            reply_markup=main_menu(),
-        )
-        return
-
-    # Random text
-    await m.answer(
-        "Send a screenshot or a public Figma frame link. Text alone isn’t enough for this bot.",
-        # menu already usually visible
-    )
+    await process_image_review(m, img_bytes, source_label="SCREEN")
 
 
 # =========================
 # MAIN
 # =========================
 async def main():
+    # Keep default parse_mode None: we only use MarkdownV2 explicitly when needed for code blocks.
     bot = Bot(
         token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=None)  # avoid HTML entity failures
+        default=DefaultBotProperties(parse_mode=None)
     )
     dp = Dispatcher()
     dp.include_router(router)
 
-    # Set bot commands (nice to have)
     try:
         await bot.set_my_commands([BotCommand(command="start", description="Start")])
     except Exception:
         pass
 
-    # Run
+    print(f"✅ Starting… OCR_LANG={OCR_LANG}, LLM_ENABLED={LLM_ENABLED}, model={LLM_MODEL}, has_key={bool(OPENAI_API_KEY)}")
     await dp.start_polling(bot)
 
 
