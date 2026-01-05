@@ -573,17 +573,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
-        # 3) Annotated screenshot
-        boxes = result.get("boxes") or []
-        if isinstance(boxes, list) and boxes:
-            try:
-                annotated_bytes = draw_annotations(img_bytes, boxes)
-                cap = f"{t(uid,'annotated')}"
-                photo = BufferedInputFile(annotated_bytes, filename="annotated.png")
-                await message.answer_photo(photo=photo, caption=escape_html(cap))
-            except Exception:
-                # if annotation fails, do not break the whole flow
-                pass
+        # 3) Annotated screenshot disabled by design
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
