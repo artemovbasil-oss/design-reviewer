@@ -326,17 +326,32 @@ def draw_annotations(img_bytes: bytes, boxes: List[TextBox]) -> Optional[bytes]:
     draw = ImageDraw.Draw(img)
     font = ImageFont.load_default()
 
+    def _text_wh(s: str) -> Tuple[int, int]:
+        # Pillow 10+: textsize removed. Use textbbox.
+        try:
+            x0, y0, x1, y1 = draw.textbbox((0, 0), s, font=font)
+            return (x1 - x0, y1 - y0)
+        except Exception:
+            # Fallback (very old pillow)
+            bbox = font.getbbox(s)  # (x0,y0,x1,y1)
+            return (bbox[2] - bbox[0], bbox[3] - bbox[1])
+
     for b in boxes[:40]:
         x1, y1 = b.x, b.y
         x2, y2 = b.x + b.w, b.y + b.h
+
+        # thick black frame (no colors, still readable)
         for t_ in range(2):
             draw.rectangle([x1 - t_, y1 - t_, x2 + t_, y2 + t_], outline=(0, 0, 0))
 
         label = str(b.idx)
-        tw, th = draw.textsize(label, font=font)  # pillow compatibility
+        tw, th = _text_wh(label)
         pad = 2
-        draw.rectangle([x1, y1 - th - 2 * pad, x1 + tw + 2 * pad, y1], fill=(255, 255, 255))
-        draw.text((x1 + pad, y1 - th - pad), label, fill=(0, 0, 0), font=font)
+
+        # label background
+        top = max(0, y1 - th - 2 * pad)
+        draw.rectangle([x1, top, x1 + tw + 2 * pad, top + th + 2 * pad], fill=(255, 255, 255))
+        draw.text((x1 + pad, top + pad), label, fill=(0, 0, 0), font=font)
 
     out = io.BytesIO()
     img.save(out, format="PNG", optimize=True)
