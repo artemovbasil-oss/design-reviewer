@@ -2,14 +2,15 @@
 # Design Reviewer Telegram bot (Aiogram 3.7+)
 # - Accepts screenshots (photos) and public Figma links (via oEmbed thumbnail)
 # - Shows compact retro ASCII progress animation (loops until done)
-# - Sends 4 outputs:
+# - Sends outputs:
 #   1) What I see
 #   2) Verdict + recommendations
-#   3) Annotated screenshot (boxes from LLM)
-#   4) ASCII wireframe concept (monospace, width-limited to avoid mobile wrapping)
+#   3) ASCII wireframe concept (monospace, width-limited to avoid mobile wrapping)
+#   4) References block (patterns + example products + links; no images)
 # - EN by default, RU toggle
 # - Menu shown only after /start and at the end of each review
 # - Cancel button works during processing
+# - Annotated screenshot is DISABLED (per your last request)
 
 import asyncio
 import base64
@@ -21,6 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote_plus
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -78,7 +80,8 @@ def set_lang(uid: int, value: str) -> None:
 
 def escape_html(s: str) -> str:
     return (
-        s.replace("&", "&amp;")
+        (s or "")
+        .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
@@ -98,19 +101,21 @@ TXT = {
             "How it works:\n"
             "1) Send a screenshot or a public Figma frame link\n"
             "2) I analyze what’s on the screen\n"
-            "3) I give a tough-but-fair review + a wireframe concept"
+            "3) I give a tough-but-fair review + a wireframe concept\n"
+            "4) I give references (patterns + example products + links)"
         ),
         "need_input": "Send a screenshot or a public Figma frame link.",
         "cancelled": "Cancelled.",
         "busy": "I’m already reviewing something. Hit Cancel, or wait for the result.",
         "no_llm": "LLM is disabled (no OPENAI_API_KEY). Add it to Railway Variables.",
         "llm_fail": "LLM error. Try again (or send a clearer / larger screenshot).",
+        "refs_fail": "Couldn’t build references this time. Try again.",
         "not_image": "I need a screenshot image or a Figma link.",
         "figma_fetch_fail": "Couldn’t fetch a preview from that Figma link. Make sure the file is public.",
         "whatisee": "What I see",
         "verdict": "Verdict & recommendations",
-        "annotated": "Annotated screenshot",
         "concept": "Wireframe concept (ASCII)",
+        "refs": "References (meaning-based)",
         "score": "Score",
         "channel_msg": "Channel:",
         "open_channel": "Open @prodooktovy",
@@ -121,6 +126,7 @@ TXT = {
         "btn_cancel": "Cancel",
         "progress_title": "Review in progress",
         "progress_wire": "Drafting wireframe",
+        "progress_refs": "Finding references",
         "preview": "Preview",
     },
     "ru": {
@@ -136,19 +142,21 @@ TXT = {
             "Как это работает:\n"
             "1) Отправь скриншот или публичную ссылку на Figma фрейм\n"
             "2) Я опишу, что вижу на экране\n"
-            "3) Дам честный разбор + черновой вайрфрейм"
+            "3) Дам честный разбор + черновой вайрфрейм\n"
+            "4) Дам референсы: паттерны + примеры продуктов + ссылки"
         ),
         "need_input": "Отправь скриншот или публичную ссылку на Figma фрейм.",
         "cancelled": "Отменено.",
         "busy": "Я уже делаю ревью. Нажми Cancel или дождись результата.",
         "no_llm": "LLM отключён (нет OPENAI_API_KEY). Добавь его в Railway Variables.",
         "llm_fail": "Ошибка LLM. Попробуй ещё раз (или пришли скрин крупнее/четче).",
+        "refs_fail": "Не получилось собрать референсы. Попробуй ещё раз.",
         "not_image": "Мне нужен скриншот или ссылка на Figma.",
         "figma_fetch_fail": "Не смог скачать превью по ссылке Figma. Убедись, что файл публичный.",
         "whatisee": "Что я вижу",
         "verdict": "Вердикт и рекомендации",
-        "annotated": "Аннотации на скрине",
         "concept": "Wireframe-концепт (ASCII)",
+        "refs": "Референсы по смыслу",
         "score": "Оценка",
         "channel_msg": "Канал:",
         "open_channel": "Открыть @prodooktovy",
@@ -159,6 +167,7 @@ TXT = {
         "btn_cancel": "Cancel",
         "progress_title": "Ревью в процессе",
         "progress_wire": "Собираю wireframe",
+        "progress_refs": "Подбираю референсы",
         "preview": "Превью",
     },
 }
@@ -294,73 +303,11 @@ def fetch_figma_thumbnail(figma_url: str) -> Optional[bytes]:
 
 
 # ----------------------------
-# Image: annotations + ascii width control
+# Image: ascii width control (annotations disabled)
 # ----------------------------
 
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, x))
-
-
-def _text_bbox(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
-    # Pillow 10+: prefer textbbox
-    try:
-        box = draw.textbbox((0, 0), text, font=font)
-        return (box[2] - box[0], box[3] - box[1])
-    except Exception:
-        # fallback
-        try:
-            box = font.getbbox(text)
-            return (box[2] - box[0], box[3] - box[1])
-        except Exception:
-            return (len(text) * 6, 10)
-
-
-def draw_annotations(img_bytes: bytes, boxes: List[Dict[str, Any]]) -> bytes:
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
-    W, H = img.size
-    draw = ImageDraw.Draw(img)
-
-    # default font (safe)
-    try:
-        font = ImageFont.load_default()
-    except Exception:
-        font = None
-
-    # monochrome look: white strokes on semi-transparent black fill
-    for i, b in enumerate(boxes[:20], start=1):
-        try:
-            x1 = int(clamp01(float(b.get("x1", 0))) * W)
-            y1 = int(clamp01(float(b.get("y1", 0))) * H)
-            x2 = int(clamp01(float(b.get("x2", 0))) * W)
-            y2 = int(clamp01(float(b.get("y2", 0))) * H)
-            if x2 <= x1 or y2 <= y1:
-                continue
-            label = str(b.get("label") or f"#{i}")[:24]
-
-            # translucent fill
-            draw.rectangle([x1, y1, x2, y2], outline=(255, 255, 255, 255), width=3)
-            draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0, 30))
-
-            # label
-            if font:
-                tw, th = _text_bbox(draw, label, font)
-                pad = 4
-                lx1, ly1 = x1, max(0, y1 - th - pad * 2)
-                lx2, ly2 = x1 + tw + pad * 2, ly1 + th + pad * 2
-                draw.rectangle([lx1, ly1, lx2, ly2], fill=(0, 0, 0, 200))
-                draw.text((lx1 + pad, ly1 + pad), label, font=font, fill=(255, 255, 255, 255))
-        except Exception:
-            continue
-
-    out = io.BytesIO()
-    img.save(out, format="PNG")
-    return out.getvalue()
-
-
-def compute_ascii_width_for_mobile(img_bytes: bytes) -> int:
+def compute_ascii_width_for_mobile(_: bytes) -> int:
     # conservative width to avoid wrapping in Telegram on phones
-    # (monospace code block still wraps if too wide)
-    # 32–38 is usually safe; pick 34 as a good default
     return 34
 
 
@@ -368,7 +315,7 @@ def enforce_ascii_lines(lines: List[str], width: int, height: int) -> List[str]:
     # truncate/pad each line to exact width and exact height
     fixed = []
     for ln in (lines or []):
-        ln = ln.replace("\t", " ")
+        ln = str(ln).replace("\t", " ")
         if len(ln) > width:
             ln = ln[:width]
         fixed.append(ln.ljust(width))
@@ -407,7 +354,7 @@ def parse_json_safe(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def llm_request(prompt_text: str, data_uri: str) -> str:
+def llm_request_with_image(prompt_text: str, data_uri: str) -> str:
     if not client:
         raise RuntimeError("No OpenAI client")
 
@@ -424,14 +371,30 @@ def llm_request(prompt_text: str, data_uri: str) -> str:
         ],
     )
 
-    # unify different sdk shapes
     try:
         return resp.output_text or ""
     except Exception:
-        try:
-            return resp.output[0].content[0].text  # type: ignore
-        except Exception:
-            return ""
+        return ""
+
+
+def llm_request_text_only(prompt_text: str) -> str:
+    if not client:
+        raise RuntimeError("No OpenAI client")
+
+    resp = client.responses.create(
+        model=LLM_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt_text}],
+            }
+        ],
+    )
+
+    try:
+        return resp.output_text or ""
+    except Exception:
+        return ""
 
 
 async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional[Dict[str, Any]]:
@@ -456,10 +419,7 @@ Tasks:
    - Guess font family vibe only (e.g., "Inter-like / SF Pro-like / Roboto-like"), no exact sizes, no hex colors.
    - If something is good, praise it and say what exactly is good.
 3) Provide a score from 1 to 10 (integer).
-4) Provide up to 12 annotation boxes for major issues or key elements.
-   - Coordinates are RELATIVE 0..1: x1,y1,x2,y2
-   - label should be short (max 24 chars), in the chosen language
-5) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} characters per line.
+4) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} characters per line.
    - Provide as an array of strings (ascii_concept).
    - Each line MUST be <= {ascii_w} chars.
    - Use simple box-drawing / ASCII, make it feel like a wireframe.
@@ -470,18 +430,173 @@ JSON schema:
   "score_10": 7,
   "what_i_see": "...",
   "verdict": "...",
-  "boxes": [{{"x1":0.1,"y1":0.2,"x2":0.4,"y2":0.3,"label":"..."}}],
   "ascii_width": {ascii_w},
   "ascii_height": 18,
   "ascii_concept": ["..."]
 }}
 """.strip()
 
-    # run sync openai call in a thread so Cancel can interrupt
     try:
-        text = await asyncio.to_thread(llm_request, prompt, data_uri)
+        text = await asyncio.to_thread(llm_request_with_image, prompt, data_uri)
         data = parse_json_safe(text)
         if not data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+# ----------------------------
+# References (patterns + example products + links)
+# ----------------------------
+
+def _lang_is_ru(lang: str) -> bool:
+    return (lang or "en").lower().startswith("ru")
+
+
+def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
+    if _lang_is_ru(lang):
+        return f"""
+Ты — старший продуктовый дизайнер. По итогам ревью экрана предложи 5–7 "референсов по смыслу".
+Нужен СТРОГО JSON, без markdown.
+
+Вход:
+1) Что видишь: {what_i_see}
+2) Вердикт/рекомендации: {verdict}
+
+Выход (строго JSON):
+{{
+  "items": [
+    {{
+      "pattern": "название паттерна (коротко)",
+      "why": "почему релевантно (1 строка)",
+      "example_products": ["Product A", "Product B", "Product C"],
+      "search_keywords": ["короткие ключевые слова для поиска референсов (EN)"]
+    }}
+  ]
+}}
+
+Правила:
+- Паттерны по смыслу (например: onboarding stepper, inline validation, progressive disclosure, single primary CTA, etc.)
+- example_products: реальные известные продукты/дизайн-системы/гайдлайны (Stripe, Revolut, Shopify, GOV.UK, Material, Apple HIG — ок)
+- search_keywords: лучше на английском, коротко, 2–5 фраз
+- Без ссылок. Без воды. Только JSON.
+""".strip()
+    else:
+        return f"""
+You are a senior product designer. Based on the review, propose 5–7 semantic UX references.
+Return STRICT JSON only (no markdown).
+
+Input:
+1) What you see: {what_i_see}
+2) Verdict / recommendations: {verdict}
+
+Output (strict JSON):
+{{
+  "items": [
+    {{
+      "pattern": "pattern name (short)",
+      "why": "why it fits (one line)",
+      "example_products": ["Product A", "Product B", "Product C"],
+      "search_keywords": ["short search keywords (EN)"]
+    }}
+  ]
+}}
+
+Rules:
+- Meaning-based patterns (onboarding stepper, inline validation, progressive disclosure, single primary CTA, etc.)
+- example_products: well-known real products / design systems / guidelines (Stripe, Revolut, Shopify, GOV.UK, Material, Apple HIG are fine)
+- search_keywords: English, 2–5 short phrases
+- No links. No fluff. JSON only.
+""".strip()
+
+
+def _safe_json_loads(s: str) -> Optional[Dict[str, Any]]:
+    s = (s or "").strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[-1]
+        s = s.rsplit("```", 1)[0].strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        # fallback: try to extract JSON object
+        return parse_json_safe(s)
+
+
+def _make_link(title: str, url: str) -> str:
+    title = escape_html(title or "")
+    url = (url or "").replace("&", "&amp;").replace("<", "").replace(">", "")
+    return f'• <a href="{url}">{title}</a>'
+
+
+def build_reference_links(lang: str, keywords: List[str]) -> List[str]:
+    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()][:3]
+    q = quote_plus(" ".join(kws)) if kws else ""
+
+    links: List[str] = []
+    if q:
+        links.append(_make_link("Dribbble search", f"https://dribbble.com/search/{q}"))
+        links.append(_make_link("Behance search", f"https://www.behance.net/search/projects?search={q}"))
+        links.append(_make_link("Google (UI pattern)", f"https://www.google.com/search?q={q}+ui+pattern"))
+
+    # Always-good sources
+    links.append(_make_link("Nielsen Norman Group (UX articles)", "https://www.nngroup.com/articles/"))
+    links.append(_make_link("Material Design (components)", "https://m3.material.io/components"))
+    links.append(_make_link("Apple HIG", "https://developer.apple.com/design/human-interface-guidelines/"))
+    links.append(_make_link("GOV.UK Design System", "https://design-system.service.gov.uk/"))
+
+    return links
+
+
+def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
+    lang = lang_for(uid)
+    title = t(uid, "refs")
+    subtitle = "Patterns → examples → links" if not _lang_is_ru(lang) else "Паттерны → примеры → ссылки"
+
+    items = (refs or {}).get("items", [])[:7]
+    lines: List[str] = [f"<b>{escape_html(title)}</b>", f"<i>{escape_html(subtitle)}</i>"]
+
+    for i, it in enumerate(items, 1):
+        pattern = str(it.get("pattern") or "").strip()
+        why = str(it.get("why") or "").strip()
+        ex = it.get("example_products") or []
+        ex = [str(x).strip() for x in ex if str(x).strip()][:4]
+        kws = it.get("search_keywords") or []
+
+        if not pattern:
+            continue
+
+        lines.append(f"\n<b>{i}) {escape_html(pattern)}</b>")
+        if why:
+            label = "Why:" if not _lang_is_ru(lang) else "Зачем:"
+            lines.append(f"{escape_html(label)} {escape_html(why)}")
+        if ex:
+            label = "Examples:" if not _lang_is_ru(lang) else "Примеры:"
+            lines.append(f"{escape_html(label)} {escape_html(', '.join(ex))}")
+
+        link_lines = build_reference_links(lang, kws)
+        if link_lines:
+            lines.append("<u>Links</u>:" if not _lang_is_ru(lang) else "<u>Ссылки</u>:")
+            # keep compact
+            lines.extend(link_lines[:3])
+
+    return "\n".join(lines).strip()
+
+
+async def llm_build_references(uid: int, what_i_see: str, verdict: str) -> Optional[Dict[str, Any]]:
+    if not client:
+        return {"error": "no_llm"}
+
+    lang = lang_for(uid)
+    prompt = build_refs_prompt(lang, what_i_see, verdict)
+
+    try:
+        raw = await asyncio.to_thread(llm_request_text_only, prompt)
+        data = _safe_json_loads(raw)
+        if not data:
+            return None
+        # normalize
+        if "items" not in data or not isinstance(data.get("items"), list):
             return None
         return data
     except Exception:
@@ -493,13 +608,11 @@ JSON schema:
 # ----------------------------
 
 async def send_channel(uid: int, m: Message) -> None:
-    lang = lang_for(uid)
     text = f"{t(uid,'channel_msg')} @prodooktovy"
     await m.answer(escape_html(text), reply_markup=channel_inline_kb())
 
 
 async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> None:
-    # mark running
     CANCEL_FLAGS[uid] = False
 
     # 1) progress spinner while LLM runs
@@ -521,7 +634,6 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             return
 
         ascii_w = compute_ascii_width_for_mobile(img_bytes)
-
         result = await llm_review_image(img_bytes, uid, ascii_w)
 
         # stop spinner
@@ -543,9 +655,10 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
             return
 
-        # enforce language in text output
+        # enforce language in result
         result["language"] = lang_for(uid)
 
+        # Score
         score = result.get("score_10", None)
         try:
             score_int = int(score)
@@ -553,10 +666,13 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             score_int = 0
         score_int = max(1, min(10, score_int))
 
+        what_i_see_text = str(result.get("what_i_see", "")).strip()
+        verdict_text = str(result.get("verdict", "")).strip()
+
         # 1) What I see
         msg1 = (
             f"<b>{escape_html(t(uid,'whatisee'))}</b>\n"
-            f"{escape_html(str(result.get('what_i_see','')).strip())}\n\n"
+            f"{escape_html(what_i_see_text)}\n\n"
             f"<b>{escape_html(t(uid,'score'))}: {score_int}/10</b>"
         )
         await message.answer(msg1)
@@ -566,21 +682,16 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             return
 
         # 2) Verdict + recommendations
-        msg2 = f"<b>{escape_html(t(uid,'verdict'))}</b>\n{escape_html(str(result.get('verdict','')).strip())}"
+        msg2 = f"<b>{escape_html(t(uid,'verdict'))}</b>\n{escape_html(verdict_text)}"
         await message.answer(msg2)
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
-        # 3) Annotated screenshot disabled by design
+        # 3) Annotated screenshot is disabled (per your request)
 
-        if CANCEL_FLAGS.get(uid):
-            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
-            return
-
-        # 4) ASCII wireframe concept
-        # small second spinner for wireframe (quick)
+        # 4) ASCII wireframe concept (with short spinner)
         done2 = asyncio.Event()
         spinner2 = asyncio.create_task(
             animate_progress_until_done(
@@ -595,8 +706,8 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
         try:
             width = int(result.get("ascii_width") or ascii_w)
             height = int(result.get("ascii_height") or 18)
-            width = max(26, min(42, width))   # keep it phone-safe
-            height = max(12, min(26, height)) # not too tall
+            width = max(26, min(42, width))   # phone-safe
+            height = max(12, min(26, height)) # compact
             lines = result.get("ascii_concept") or []
             if not isinstance(lines, list):
                 lines = []
@@ -611,6 +722,42 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
 
         msg4 = f"<b>{escape_html(t(uid,'concept'))}</b>\n<code>{escape_html(concept_block)}</code>"
         await message.answer(msg4)
+
+        if CANCEL_FLAGS.get(uid):
+            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            return
+
+        # 5) References block (patterns + example products + links)
+        done3 = asyncio.Event()
+        spinner3 = asyncio.create_task(
+            animate_progress_until_done(
+                message,
+                uid,
+                title=t(uid, "progress_refs"),
+                done_event=done3,
+                tick=0.12,
+            )
+        )
+
+        try:
+            refs = await llm_build_references(uid, what_i_see_text, verdict_text)
+        finally:
+            done3.set()
+            try:
+                await spinner3
+            except Exception:
+                pass
+
+        if CANCEL_FLAGS.get(uid):
+            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            return
+
+        if not refs or refs.get("error") == "no_llm":
+            await message.answer(escape_html(t(uid, "refs_fail")), reply_markup=main_menu_kb(uid))
+        else:
+            refs_msg = format_refs_block(uid, refs)
+            # prevent ugly previews
+            await message.answer(refs_msg, disable_web_page_preview=True)
 
         # menu at the end
         await message.answer(escape_html(t(uid, "need_input")), reply_markup=main_menu_kb(uid))
