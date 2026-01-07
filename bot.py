@@ -6,11 +6,11 @@
 #   1) What I see
 #   2) Verdict + recommendations
 #   3) ASCII wireframe concept (monospace, width-limited to avoid mobile wrapping)
-#   4) References block (patterns + example products + links; no images)
+#   4) References block (meaning-based; patterns + example products + Pinterest/Dribbble links; no images)
 # - EN by default, RU toggle
 # - Menu shown only after /start and at the end of each review
 # - Cancel button works during processing
-# - Annotated screenshot is DISABLED (per your last request)
+# - Annotated screenshot is DISABLED
 
 import asyncio
 import base64
@@ -21,10 +21,10 @@ import re
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
@@ -78,6 +78,10 @@ def set_lang(uid: int, value: str) -> None:
     LANG[uid] = "ru" if value == "ru" else "en"
 
 
+def _lang_is_ru(lang: str) -> bool:
+    return (lang or "en").lower().startswith("ru")
+
+
 def escape_html(s: str) -> str:
     return (
         (s or "")
@@ -118,7 +122,6 @@ TXT = {
         "refs": "References (meaning-based)",
         "score": "Score",
         "channel_msg": "Channel:",
-        "open_channel": "Open @prodooktovy",
         "menu_submit": "Submit for review",
         "menu_how": "How it works?",
         "menu_lang": "Language: EN/RU",
@@ -128,6 +131,11 @@ TXT = {
         "progress_wire": "Drafting wireframe",
         "progress_refs": "Finding references",
         "preview": "Preview",
+        "refs_sub": "Patterns → examples → links",
+        "label_why": "Why:",
+        "label_examples": "Examples:",
+        "label_look": "Look for:",
+        "label_links": "Links:",
     },
     "ru": {
         "title": "Design Reviewer",
@@ -159,7 +167,6 @@ TXT = {
         "refs": "Референсы по смыслу",
         "score": "Оценка",
         "channel_msg": "Канал:",
-        "open_channel": "Открыть @prodooktovy",
         "menu_submit": "Закинуть на ревью",
         "menu_how": "Как это работает?",
         "menu_lang": "Язык: EN/RU",
@@ -169,6 +176,11 @@ TXT = {
         "progress_wire": "Собираю wireframe",
         "progress_refs": "Подбираю референсы",
         "preview": "Превью",
+        "refs_sub": "Паттерны → примеры → ссылки",
+        "label_why": "Зачем:",
+        "label_examples": "Примеры:",
+        "label_look": "Смотри в референсах:",
+        "label_links": "Ссылки:",
     },
 }
 
@@ -182,7 +194,6 @@ def t(uid: int, key: str) -> str:
 # ----------------------------
 
 def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
-    # 3 buttons total, last row contains channel + language
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=t(uid, "menu_submit"))],
@@ -197,17 +208,13 @@ def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
 
 def cancel_kb(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=t(uid, "btn_cancel"), callback_data=f"cancel:{uid}")]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text=t(uid, "btn_cancel"), callback_data=f"cancel:{uid}")]]
     )
 
 
 def channel_inline_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Open @prodooktovy", url="https://t.me/prodooktovy")]
-        ]
+        inline_keyboard=[[InlineKeyboardButton(text="@prodooktovy", url="https://t.me/prodooktovy")]]
     )
 
 
@@ -216,7 +223,6 @@ def channel_inline_kb() -> InlineKeyboardMarkup:
 # ----------------------------
 
 def retro_bar_frame(step: int, width: int = 16) -> str:
-    # compact retro "scanner" bar
     pos = step % width
     inside = ["·"] * width
     inside[pos] = "█"
@@ -236,9 +242,6 @@ async def animate_progress_until_done(
     done_event: asyncio.Event,
     tick: float = 0.12,
 ) -> Message:
-    """
-    Sends ONE message and keeps editing it until done_event is set or cancelled.
-    """
     msg = await anchor.answer(
         f"{escape_html(title)}\n<code>{escape_html(retro_bar_frame(0))}</code>",
         reply_markup=cancel_kb(uid),
@@ -255,7 +258,6 @@ async def animate_progress_until_done(
                 reply_markup=cancel_kb(uid),
             )
         except Exception:
-            # "message can't be edited" / throttling / etc — ignore, keep going
             pass
         await asyncio.sleep(tick)
 
@@ -273,20 +275,15 @@ def is_figma_link(text: str) -> bool:
 
 
 def http_get_bytes(url: str, timeout: float = 20.0) -> bytes:
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        method="GET",
-    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
 
 
 def fetch_figma_thumbnail(figma_url: str) -> Optional[bytes]:
-    # cache-bust to avoid "same result for every link" in some proxy/CDN layers
     bust = str(int(time.time() * 1000))
     oembed = "https://www.figma.com/oembed?url=" + urllib.parse.quote(figma_url, safe="")
-    oembed += ("&cb=" + bust)
+    oembed += "&cb=" + bust
 
     try:
         raw = http_get_bytes(oembed, timeout=20.0)
@@ -294,7 +291,6 @@ def fetch_figma_thumbnail(figma_url: str) -> Optional[bytes]:
         thumb = data.get("thumbnail_url")
         if not thumb:
             return None
-        # additional cache-bust on thumbnail url
         sep = "&" if "?" in thumb else "?"
         thumb2 = thumb + f"{sep}cb={bust}"
         return http_get_bytes(thumb2, timeout=25.0)
@@ -303,17 +299,15 @@ def fetch_figma_thumbnail(figma_url: str) -> Optional[bytes]:
 
 
 # ----------------------------
-# Image: ascii width control (annotations disabled)
+# Image: ASCII width control
 # ----------------------------
 
 def compute_ascii_width_for_mobile(_: bytes) -> int:
-    # conservative width to avoid wrapping in Telegram on phones
     return 34
 
 
 def enforce_ascii_lines(lines: List[str], width: int, height: int) -> List[str]:
-    # truncate/pad each line to exact width and exact height
-    fixed = []
+    fixed: List[str] = []
     for ln in (lines or []):
         ln = str(ln).replace("\t", " ")
         if len(ln) > width:
@@ -331,7 +325,6 @@ def enforce_ascii_lines(lines: List[str], width: int, height: int) -> List[str]:
 # ----------------------------
 
 def img_to_data_uri_png(img_bytes: bytes) -> str:
-    # ensure PNG to keep things consistent
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     out = io.BytesIO()
     img.save(out, format="PNG")
@@ -342,7 +335,6 @@ def img_to_data_uri_png(img_bytes: bytes) -> str:
 def parse_json_safe(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
-    # try to extract JSON object from text
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -360,21 +352,15 @@ def llm_request_with_image(prompt_text: str, data_uri: str) -> str:
 
     resp = client.responses.create(
         model=LLM_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": prompt_text},
-                    {"type": "input_image", "image_url": data_uri},
-                ],
-            }
-        ],
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt_text},
+                {"type": "input_image", "image_url": data_uri},
+            ],
+        }],
     )
-
-    try:
-        return resp.output_text or ""
-    except Exception:
-        return ""
+    return getattr(resp, "output_text", "") or ""
 
 
 def llm_request_text_only(prompt_text: str) -> str:
@@ -383,18 +369,12 @@ def llm_request_text_only(prompt_text: str) -> str:
 
     resp = client.responses.create(
         model=LLM_MODEL,
-        input=[
-            {
-                "role": "user",
-                "content": [{"type": "input_text", "text": prompt_text}],
-            }
-        ],
+        input=[{
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt_text}],
+        }],
     )
-
-    try:
-        return resp.output_text or ""
-    except Exception:
-        return ""
+    return getattr(resp, "output_text", "") or ""
 
 
 async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional[Dict[str, Any]]:
@@ -404,7 +384,6 @@ async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional
     language = lang_for(uid)
     data_uri = img_to_data_uri_png(img_bytes)
 
-    # Keep output strictly JSON to avoid Telegram HTML parsing crashes
     prompt = f"""
 You are a tough-but-fair senior product designer doing a design review.
 
@@ -439,75 +418,87 @@ JSON schema:
     try:
         text = await asyncio.to_thread(llm_request_with_image, prompt, data_uri)
         data = parse_json_safe(text)
-        if not data:
-            return None
         return data
     except Exception:
         return None
 
 
 # ----------------------------
-# References (patterns + example products + links)
+# References (meaning-based, more precise + Pinterest)
 # ----------------------------
-
-def _lang_is_ru(lang: str) -> bool:
-    return (lang or "en").lower().startswith("ru")
-
 
 def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
     if _lang_is_ru(lang):
         return f"""
-Ты — старший продуктовый дизайнер. По итогам ревью экрана предложи 5–7 "референсов по смыслу".
-Нужен СТРОГО JSON, без markdown.
+Ты — старший продуктовый дизайнер. Подбери максимально точные референсы "по смыслу" (НЕ по визуалу).
+Верни СТРОГО JSON, без markdown.
 
-Вход:
+Контекст:
 1) Что видишь: {what_i_see}
 2) Вердикт/рекомендации: {verdict}
 
 Выход (строго JSON):
 {{
+  "intent": {{
+    "product_domain": "fintech|ecommerce|travel|health|saas|marketplace|other",
+    "platform": "ios|android|web|unknown",
+    "journey_stage": "onboarding|auth|checkout|search|listing|details|settings|empty_state|other",
+    "primary_pattern": "коротко",
+    "key_components": ["..."],
+    "user_goal": "1 строка"
+  }},
   "items": [
     {{
-      "pattern": "название паттерна (коротко)",
+      "pattern": "название паттерна",
       "why": "почему релевантно (1 строка)",
+      "what_to_look_for": ["3–5 must-have деталей"],
       "example_products": ["Product A", "Product B", "Product C"],
-      "search_keywords": ["короткие ключевые слова для поиска референсов (EN)"]
+      "search_keywords": ["точный запрос (EN)", "ещё запрос (EN)"]
     }}
   ]
 }}
 
 Правила:
-- Паттерны по смыслу (например: onboarding stepper, inline validation, progressive disclosure, single primary CTA, etc.)
-- example_products: реальные известные продукты/дизайн-системы/гайдлайны (Stripe, Revolut, Shopify, GOV.UK, Material, Apple HIG — ок)
-- search_keywords: лучше на английском, коротко, 2–5 фраз
-- Без ссылок. Без воды. Только JSON.
+- 5–7 items
+- search_keywords: только английский, максимально конкретно (platform + domain + pattern + component + constraint)
+- example_products: реальные продукты/дизайн-системы/гайдлайны
+- Никаких ссылок. Только JSON.
 """.strip()
     else:
         return f"""
-You are a senior product designer. Based on the review, propose 5–7 semantic UX references.
-Return STRICT JSON only (no markdown).
+You are a senior product designer. Find highly precise meaning-based references (not visually similar).
+Return STRICT JSON only. No markdown.
 
-Input:
+Context:
 1) What you see: {what_i_see}
 2) Verdict / recommendations: {verdict}
 
 Output (strict JSON):
 {{
+  "intent": {{
+    "product_domain": "fintech|ecommerce|travel|health|saas|marketplace|other",
+    "platform": "ios|android|web|unknown",
+    "journey_stage": "onboarding|auth|checkout|search|listing|details|settings|empty_state|other",
+    "primary_pattern": "short",
+    "key_components": ["..."],
+    "user_goal": "one line"
+  }},
   "items": [
     {{
-      "pattern": "pattern name (short)",
+      "pattern": "pattern name",
       "why": "why it fits (one line)",
+      "what_to_look_for": ["3–5 must-have traits"],
       "example_products": ["Product A", "Product B", "Product C"],
-      "search_keywords": ["short search keywords (EN)"]
+      "search_keywords": ["precise EN query", "another EN query"]
     }}
   ]
 }}
 
 Rules:
-- Meaning-based patterns (onboarding stepper, inline validation, progressive disclosure, single primary CTA, etc.)
-- example_products: well-known real products / design systems / guidelines (Stripe, Revolut, Shopify, GOV.UK, Material, Apple HIG are fine)
-- search_keywords: English, 2–5 short phrases
-- No links. No fluff. JSON only.
+- 5–7 items
+- search_keywords: English only, very specific (platform + domain + pattern + component + constraint)
+- example_products: real products / design systems / guidelines
+- No links. JSON only.
 """.strip()
 
 
@@ -519,7 +510,6 @@ def _safe_json_loads(s: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(s)
     except Exception:
-        # fallback: try to extract JSON object
         return parse_json_safe(s)
 
 
@@ -529,19 +519,20 @@ def _make_link(title: str, url: str) -> str:
     return f'• <a href="{url}">{title}</a>'
 
 
-def build_reference_links(lang: str, keywords: List[str]) -> List[str]:
-    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()][:3]
-    q = quote_plus(" ".join(kws)) if kws else ""
+def build_reference_links(keywords: List[str]) -> List[str]:
+    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    picked = kws[:2]
+    q = quote_plus(" ".join(picked)) if picked else ""
 
     links: List[str] = []
     if q:
-        links.append(_make_link("Dribbble search", f"https://dribbble.com/search/{q}"))
-        links.append(_make_link("Behance search", f"https://www.behance.net/search/projects?search={q}"))
-        links.append(_make_link("Google (UI pattern)", f"https://www.google.com/search?q={q}+ui+pattern"))
+        links.append(_make_link("Pinterest", f"https://www.pinterest.com/search/pins/?q={q}"))
+        links.append(_make_link("Dribbble", f"https://dribbble.com/search/{q}"))
+        links.append(_make_link("Google (pattern)", f"https://www.google.com/search?q={q}+ui+pattern"))
+        links.append(_make_link("Google Images", f"https://www.google.com/search?tbm=isch&q={q}+ui"))
 
-    # Always-good sources
-    links.append(_make_link("Nielsen Norman Group (UX articles)", "https://www.nngroup.com/articles/"))
-    links.append(_make_link("Material Design (components)", "https://m3.material.io/components"))
+    links.append(_make_link("Nielsen Norman Group", "https://www.nngroup.com/articles/"))
+    links.append(_make_link("Material Design", "https://m3.material.io/components"))
     links.append(_make_link("Apple HIG", "https://developer.apple.com/design/human-interface-guidelines/"))
     links.append(_make_link("GOV.UK Design System", "https://design-system.service.gov.uk/"))
 
@@ -549,36 +540,54 @@ def build_reference_links(lang: str, keywords: List[str]) -> List[str]:
 
 
 def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
-    lang = lang_for(uid)
     title = t(uid, "refs")
-    subtitle = "Patterns → examples → links" if not _lang_is_ru(lang) else "Паттерны → примеры → ссылки"
+    subtitle = t(uid, "refs_sub")
 
-    items = (refs or {}).get("items", [])[:7]
+    items = (refs or {}).get("items", [])
+    if not isinstance(items, list):
+        items = []
+    items = items[:7]
+
     lines: List[str] = [f"<b>{escape_html(title)}</b>", f"<i>{escape_html(subtitle)}</i>"]
 
-    for i, it in enumerate(items, 1):
-        pattern = str(it.get("pattern") or "").strip()
-        why = str(it.get("why") or "").strip()
-        ex = it.get("example_products") or []
-        ex = [str(x).strip() for x in ex if str(x).strip()][:4]
-        kws = it.get("search_keywords") or []
+    intent = (refs or {}).get("intent", {})
+    if isinstance(intent, dict):
+        pd = str(intent.get("product_domain") or "").strip()
+        st = str(intent.get("journey_stage") or "").strip()
+        pp = str(intent.get("primary_pattern") or "").strip()
+        parts = [p for p in [pd, st, pp] if p]
+        if parts:
+            lines.append(f"\n<i>{escape_html(' / '.join(parts))}</i>")
 
+    for i, it in enumerate(items, 1):
+        if not isinstance(it, dict):
+            continue
+
+        pattern = str(it.get("pattern") or "").strip()
         if not pattern:
             continue
 
+        why = str(it.get("why") or "").strip()
+        ex = it.get("example_products") or []
+        ex = [str(x).strip() for x in ex if str(x).strip()][:4]
+        w = it.get("what_to_look_for") or []
+        w = [str(x).strip() for x in w if str(x).strip()][:5]
+        kws = it.get("search_keywords") or []
+        kws = [str(x).strip() for x in kws if str(x).strip()][:4]
+
         lines.append(f"\n<b>{i}) {escape_html(pattern)}</b>")
         if why:
-            label = "Why:" if not _lang_is_ru(lang) else "Зачем:"
-            lines.append(f"{escape_html(label)} {escape_html(why)}")
+            lines.append(f"{escape_html(t(uid,'label_why'))} {escape_html(why)}")
+        if w:
+            lines.append(f"{escape_html(t(uid,'label_look'))} {escape_html('; '.join(w))}")
         if ex:
-            label = "Examples:" if not _lang_is_ru(lang) else "Примеры:"
-            lines.append(f"{escape_html(label)} {escape_html(', '.join(ex))}")
+            lines.append(f"{escape_html(t(uid,'label_examples'))} {escape_html(', '.join(ex))}")
 
-        link_lines = build_reference_links(lang, kws)
+        link_lines = build_reference_links(kws)
         if link_lines:
-            lines.append("<u>Links</u>:" if not _lang_is_ru(lang) else "<u>Ссылки</u>:")
-            # keep compact
-            lines.extend(link_lines[:3])
+            lines.append(f"<u>{escape_html(t(uid,'label_links'))}</u>")
+            # compact set: top 3 + a stable one
+            lines.extend(link_lines[:3] + link_lines[-1:])
 
     return "\n".join(lines).strip()
 
@@ -587,16 +596,13 @@ async def llm_build_references(uid: int, what_i_see: str, verdict: str) -> Optio
     if not client:
         return {"error": "no_llm"}
 
-    lang = lang_for(uid)
-    prompt = build_refs_prompt(lang, what_i_see, verdict)
-
+    prompt = build_refs_prompt(lang_for(uid), what_i_see, verdict)
     try:
         raw = await asyncio.to_thread(llm_request_text_only, prompt)
         data = _safe_json_loads(raw)
-        if not data:
+        if not isinstance(data, dict):
             return None
-        # normalize
-        if "items" not in data or not isinstance(data.get("items"), list):
+        if "items" not in data or not isinstance(data.get("items"), list) or not data["items"]:
             return None
         return data
     except Exception:
@@ -615,7 +621,6 @@ async def send_channel(uid: int, m: Message) -> None:
 async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> None:
     CANCEL_FLAGS[uid] = False
 
-    # 1) progress spinner while LLM runs
     done = asyncio.Event()
     spinner_task = asyncio.create_task(
         animate_progress_until_done(
@@ -636,7 +641,6 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
         ascii_w = compute_ascii_width_for_mobile(img_bytes)
         result = await llm_review_image(img_bytes, uid, ascii_w)
 
-        # stop spinner
         done.set()
         try:
             await spinner_task
@@ -655,13 +659,10 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
             return
 
-        # enforce language in result
         result["language"] = lang_for(uid)
 
-        # Score
-        score = result.get("score_10", None)
         try:
-            score_int = int(score)
+            score_int = int(result.get("score_10", 0))
         except Exception:
             score_int = 0
         score_int = max(1, min(10, score_int))
@@ -681,7 +682,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
-        # 2) Verdict + recommendations
+        # 2) Verdict
         msg2 = f"<b>{escape_html(t(uid,'verdict'))}</b>\n{escape_html(verdict_text)}"
         await message.answer(msg2)
 
@@ -689,9 +690,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
-        # 3) Annotated screenshot is disabled (per your request)
-
-        # 4) ASCII wireframe concept (with short spinner)
+        # 3) ASCII wireframe (spinner)
         done2 = asyncio.Event()
         spinner2 = asyncio.create_task(
             animate_progress_until_done(
@@ -706,8 +705,8 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
         try:
             width = int(result.get("ascii_width") or ascii_w)
             height = int(result.get("ascii_height") or 18)
-            width = max(26, min(42, width))   # phone-safe
-            height = max(12, min(26, height)) # compact
+            width = max(26, min(42, width))
+            height = max(12, min(26, height))
             lines = result.get("ascii_concept") or []
             if not isinstance(lines, list):
                 lines = []
@@ -720,14 +719,14 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             except Exception:
                 pass
 
-        msg4 = f"<b>{escape_html(t(uid,'concept'))}</b>\n<code>{escape_html(concept_block)}</code>"
-        await message.answer(msg4)
+        msg3 = f"<b>{escape_html(t(uid,'concept'))}</b>\n<code>{escape_html(concept_block)}</code>"
+        await message.answer(msg3)
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
             return
 
-        # 5) References block (patterns + example products + links)
+        # 4) References (spinner)
         done3 = asyncio.Event()
         spinner3 = asyncio.create_task(
             animate_progress_until_done(
@@ -756,7 +755,6 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             await message.answer(escape_html(t(uid, "refs_fail")), reply_markup=main_menu_kb(uid))
         else:
             refs_msg = format_refs_block(uid, refs)
-            # prevent ugly previews
             await message.answer(refs_msg, disable_web_page_preview=True)
 
         # menu at the end
@@ -784,7 +782,6 @@ async def on_cancel(cb: CallbackQuery):
 
     CANCEL_FLAGS[uid] = True
 
-    # cancel running task if exists
     task = RUNNING_TASK.get(uid)
     if task and not task.done():
         task.cancel()
@@ -817,13 +814,11 @@ async def on_text(m: Message, bot: Bot):
     uid = m.from_user.id
     txt = (m.text or "").strip()
 
-    # menu actions
     if txt == t(uid, "menu_how"):
         await m.answer(escape_html(t(uid, "how")), reply_markup=main_menu_kb(uid))
         return
 
     if txt == t(uid, "menu_lang"):
-        # toggle
         new_lang = "ru" if lang_for(uid) == "en" else "en"
         set_lang(uid, new_lang)
         await m.answer(escape_html(t(uid, "start")), reply_markup=main_menu_kb(uid))
@@ -837,7 +832,6 @@ async def on_text(m: Message, bot: Bot):
         await m.answer(escape_html(t(uid, "need_input")))
         return
 
-    # figma link
     if is_figma_link(txt):
         if RUNNING_TASK.get(uid) and not RUNNING_TASK[uid].done():
             await m.answer(escape_html(t(uid, "busy")))
@@ -848,7 +842,6 @@ async def on_text(m: Message, bot: Bot):
             await m.answer(escape_html(t(uid, "figma_fetch_fail")), reply_markup=main_menu_kb(uid))
             return
 
-        # show preview image first (optional)
         try:
             photo = BufferedInputFile(thumb, filename="figma_preview.png")
             await m.answer_photo(photo=photo, caption=escape_html(t(uid, "preview")))
@@ -862,7 +855,6 @@ async def on_text(m: Message, bot: Bot):
         RUNNING_TASK[uid] = task
         return
 
-    # otherwise
     await m.answer(escape_html(t(uid, "not_image")), reply_markup=main_menu_kb(uid))
 
 
@@ -874,7 +866,6 @@ async def on_photo(m: Message, bot: Bot):
         await m.answer(escape_html(t(uid, "busy")))
         return
 
-    # download best size
     photo = m.photo[-1]
     file = await bot.get_file(photo.file_id)
     img_bytes = await bot.download_file(file.file_path)
