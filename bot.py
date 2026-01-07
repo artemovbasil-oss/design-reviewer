@@ -1,12 +1,12 @@
 # bot.py
 # Design Reviewer Telegram bot (Aiogram 3.7+)
 # - Accepts screenshots (photos) and public Figma links (via oEmbed thumbnail)
-# - Shows compact retro ASCII progress animation (loops until done)
+# - Shows compact retro ASCII progress animation (loops until done) + deletes spinner message after completion
 # - Sends outputs:
 #   1) What I see
-#   2) Verdict + recommendations
+#   2) Verdict + recommendations (more concrete, no font guessing)
 #   3) ASCII wireframe concept (monospace, width-limited to avoid mobile wrapping)
-#   4) References block (meaning-based; patterns + example products + Pinterest/Dribbble links; no images)
+#   4) References block (meaning-based; patterns + example products + ONLY 3 search links; no images)
 # - EN by default, RU toggle
 # - Menu shown only after /start and at the end of each review
 # - Cancel button works during processing
@@ -136,6 +136,9 @@ TXT = {
         "label_examples": "Examples:",
         "label_look": "Look for:",
         "label_links": "Links:",
+        "link_pinterest": "Pinterest",
+        "link_dribbble": "Dribbble",
+        "link_google": "Google (pattern)",
     },
     "ru": {
         "title": "Design Reviewer",
@@ -181,6 +184,9 @@ TXT = {
         "label_examples": "Примеры:",
         "label_look": "Смотри в референсах:",
         "label_links": "Ссылки:",
+        "link_pinterest": "Pinterest",
+        "link_dribbble": "Dribbble",
+        "link_google": "Google (pattern)",
     },
 }
 
@@ -219,29 +225,41 @@ def channel_inline_kb() -> InlineKeyboardMarkup:
 
 
 # ----------------------------
-# Progress animation (compact + more alive)
+# Progress animation (compact + richer movement)
 # ----------------------------
 
-_SPIN = ["|", "/", "-", "\\"]  # pure ASCII, safe for Telegram HTML
+_SPIN = ["|", "/", "-", "\\"]  # safe ASCII
+_TICK = ["·", "•", "·", "•"]
 
-def retro_bar_frame(step: int, width: int = 16) -> str:
+def retro_bar_frame(step: int, width: int = 18) -> str:
     """
-    Compact 3-line retro widget:
-    - spinner animates in the top-left
-    - scanner bar moves (with tail)
-    - subtle blinking corners effect via alternating top line prefix
+    3-line compact retro HUD:
+    - moving "scanner" with trail
+    - a second element moving opposite direction
+    - spinner + "tick" symbol to feel alive
     """
-    spin = _SPIN[step % len(_SPIN)]
-    pos = step % width
-    inside = ["·"] * width
+    spin = _SPIN[step % 4]
+    tick = _TICK[step % 4]
 
-    inside[pos] = "█"
-    inside[(pos - 1) % width] = "▓"
-    inside[(pos - 2) % width] = "▒"
+    p1 = step % width
+    p2 = (width - 1) - (step % width)
 
-    top = f"{spin}┌" + "─" * width + "┐"
-    mid = " │" + "".join(inside) + "│"
-    bot = " └" + "─" * width + "┘"
+    cells = ["·"] * width
+
+    # scanner 1
+    cells[p1] = "█"
+    cells[(p1 - 1) % width] = "▓"
+    cells[(p1 - 2) % width] = "▒"
+
+    # scanner 2 (opposite)
+    if cells[p2] == "·":
+        cells[p2] = "■"
+    elif cells[p2] in ("▒", "▓"):
+        cells[p2] = "█"
+
+    top = f"{spin}{tick}┌" + "─" * width + "┐"
+    mid = "  │" + "".join(cells) + "│"
+    bot = "  └" + "─" * width + "┘"
     return top + "\n" + mid + "\n" + bot
 
 
@@ -250,7 +268,7 @@ async def animate_progress_until_done(
     uid: int,
     title: str,
     done_event: asyncio.Event,
-    tick: float = 0.10,  # a bit snappier
+    tick: float = 0.10,
 ) -> Message:
     msg = await anchor.answer(
         f"{escape_html(title)}\n<code>{escape_html(retro_bar_frame(0))}</code>",
@@ -272,6 +290,16 @@ async def animate_progress_until_done(
         await asyncio.sleep(tick)
 
     return msg
+
+
+async def safe_delete_message(msg: Optional[Message]) -> None:
+    if not msg:
+        return
+    try:
+        await msg.delete()
+    except Exception:
+        # can't delete (permissions / too old / etc.)
+        pass
 
 
 # ----------------------------
@@ -394,24 +422,28 @@ async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional
     language = lang_for(uid)
     data_uri = img_to_data_uri_png(img_bytes)
 
+    # No font guessing. More concrete: hierarchy, spacing, CTA, copy, states, accessibility.
     prompt = f"""
 You are a tough-but-fair senior product designer doing a design review.
 
 Return ONLY valid JSON. No markdown. No extra keys.
 
 Language: "{language}" ("en" or "ru").
-Be honest, no profanity.
+Be honest. No profanity.
 
 Tasks:
 1) Describe what you see on the screenshot (short, concrete).
-2) Give verdict + recommendations (mix UI/UX + text, actionable).
-   - Guess font family vibe only (e.g., "Inter-like / SF Pro-like / Roboto-like"), no exact sizes, no hex colors.
-   - If something is good, praise it and say what exactly is good.
+2) Give verdict + recommendations (actionable, concrete).
+   - Do NOT guess font families.
+   - Avoid exact pixels and hex colors.
+   - Be specific: name UI parts (header, primary CTA, input, helper text, error state, empty state, list rows, cards).
+   - Include: hierarchy, spacing, CTA clarity, copy improvements, states (loading/error/disabled), accessibility (contrast, tap targets).
+   - If something is good, say what exactly.
 3) Provide a score from 1 to 10 (integer).
-4) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} characters per line.
+4) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} chars per line.
    - Provide as an array of strings (ascii_concept).
    - Each line MUST be <= {ascii_w} chars.
-   - Use simple box-drawing / ASCII, make it feel like a wireframe.
+   - Make it a meaningful wireframe: structure + key components + CTA placement.
 
 JSON schema:
 {{
@@ -433,14 +465,14 @@ JSON schema:
 
 
 # ----------------------------
-# References (simpler scope, no "intent guessing")
+# References (simpler scope, ONLY 3 search links)
 # ----------------------------
 
 def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
     if _lang_is_ru(lang):
         return f"""
 Ты — старший продуктовый дизайнер. Подбери референсы "по смыслу" (НЕ по визуалу).
-Не пытайся угадывать платформу/индустрию. Делай проще: паттерн + компоненты + намерение пользователя.
+Не угадывай платформу/индустрию. Сфокусируйся на паттерне, компонентах, цели пользователя.
 
 Верни СТРОГО JSON (без markdown).
 
@@ -463,14 +495,14 @@ def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
 
 Правила:
 - 5–7 items
-- search_keywords: английский, но без 'ios/web/fintech/saas' — только паттерн + компонент + цель (коротко и конкретно)
+- search_keywords: английский, коротко и конкретно. Не добавляй 'ios/web/fintech/saas'.
 - example_products: реальные продукты/дизайн-системы/гайдлайны
 - Никаких ссылок. Только JSON.
 """.strip()
     else:
         return f"""
 You are a senior product designer. Provide meaning-based references (NOT visually similar).
-Do NOT guess platform/domain (no iOS/web/fintech/saas guessing). Keep it simple: pattern + components + user intent.
+Do NOT guess platform/domain. Focus on pattern, components, user intent.
 
 Return STRICT JSON only (no markdown).
 
@@ -493,7 +525,7 @@ Output (strict JSON):
 
 Rules:
 - 5–7 items
-- search_keywords: English, but no 'ios/web/fintech/saas' — only pattern + component + intent (short & concrete)
+- search_keywords: English, short & concrete. Do not add 'ios/web/fintech/saas'.
 - example_products: real products / design systems / guidelines
 - No links. JSON only.
 """.strip()
@@ -522,42 +554,35 @@ def _normalize_keywords(keywords: List[str]) -> List[str]:
         k = str(k).strip()
         if not k:
             continue
-        # keep short and safe
         k = re.sub(r"\s+", " ", k)
         if len(k) > 80:
             k = k[:80]
         cleaned.append(k)
-    # dedupe preserving order
     out: List[str] = []
     seen = set()
     for k in cleaned:
-        if k.lower() in seen:
+        kl = k.lower()
+        if kl in seen:
             continue
-        seen.add(k.lower())
+        seen.add(kl)
         out.append(k)
     return out[:3]
 
 
-def build_reference_links(keywords: List[str]) -> List[str]:
-    # Better “scope”: we do NOT add domain/platform guesses.
-    # We simply search for: (keyword) + "ui pattern" or keep keywords as-is.
+def build_reference_links(uid: int, keywords: List[str]) -> List[str]:
     kws = _normalize_keywords(keywords)
     q_base = " ".join(kws).strip()
     q = quote_plus(q_base) if q_base else ""
 
-    links: List[str] = []
-    if q:
-        links.append(_make_link("Pinterest", f"https://www.pinterest.com/search/pins/?q={q}"))
-        links.append(_make_link("Dribbble", f"https://dribbble.com/search/{q}"))
-        links.append(_make_link("Google (pattern)", f"https://www.google.com/search?q={q}+ui+pattern"))
-        links.append(_make_link("Google Images", f"https://www.google.com/search?tbm=isch&q={q}+ui"))
+    if not q:
+        return []
 
-    # “Stable” sources (not repeating GOV.UK every time)
-    links.append(_make_link("Nielsen Norman Group", "https://www.nngroup.com/articles/"))
-    links.append(_make_link("Material Design", "https://m3.material.io/components"))
-    links.append(_make_link("Apple HIG", "https://developer.apple.com/design/human-interface-guidelines/"))
-
-    return links
+    # ONLY 3 links (as requested)
+    return [
+        _make_link(t(uid, "link_pinterest"), f"https://www.pinterest.com/search/pins/?q={q}"),
+        _make_link(t(uid, "link_dribbble"), f"https://dribbble.com/search/{q}"),
+        _make_link(t(uid, "link_google"), f"https://www.google.com/search?q={q}+ui+pattern"),
+    ]
 
 
 def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
@@ -584,8 +609,7 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
         ex = [str(x).strip() for x in ex if str(x).strip()][:4]
         w = it.get("what_to_look_for") or []
         w = [str(x).strip() for x in w if str(x).strip()][:5]
-        kws = it.get("search_keywords") or []
-        kws = _normalize_keywords(kws)
+        kws = _normalize_keywords(it.get("search_keywords") or [])
 
         lines.append(f"\n<b>{i}) {escape_html(pattern)}</b>")
         if why:
@@ -595,15 +619,10 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
         if ex:
             lines.append(f"{escape_html(t(uid,'label_examples'))} {escape_html(', '.join(ex))}")
 
-        link_lines = build_reference_links(kws)
+        link_lines = build_reference_links(uid, kws)
         if link_lines:
             lines.append(f"<u>{escape_html(t(uid,'label_links'))}</u>")
-            # compact: 3 search + 1 stable
-            if kws:
-                lines.extend(link_lines[:3] + link_lines[-1:])
-            else:
-                # if no keywords, show only stable ones
-                lines.extend(link_lines[-3:])
+            lines.extend(link_lines)
 
     return "\n".join(lines).strip()
 
@@ -647,10 +666,16 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             tick=0.10,
         )
     )
+    spinner_msg: Optional[Message] = None
 
     try:
         if not client:
             done.set()
+            try:
+                spinner_msg = await spinner_task
+                await safe_delete_message(spinner_msg)
+            except Exception:
+                pass
             await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
             return
 
@@ -659,7 +684,8 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
 
         done.set()
         try:
-            await spinner_task
+            spinner_msg = await spinner_task
+            await safe_delete_message(spinner_msg)  # ✅ delete spinner after done
         except Exception:
             pass
 
@@ -717,6 +743,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
                 tick=0.10,
             )
         )
+        spinner2_msg: Optional[Message] = None
 
         try:
             width = int(result.get("ascii_width") or ascii_w)
@@ -731,7 +758,8 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
         finally:
             done2.set()
             try:
-                await spinner2
+                spinner2_msg = await spinner2
+                await safe_delete_message(spinner2_msg)  # ✅ delete spinner
             except Exception:
                 pass
 
@@ -753,13 +781,15 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
                 tick=0.10,
             )
         )
+        spinner3_msg: Optional[Message] = None
 
         try:
             refs = await llm_build_references(uid, what_i_see_text, verdict_text)
         finally:
             done3.set()
             try:
-                await spinner3
+                spinner3_msg = await spinner3
+                await safe_delete_message(spinner3_msg)  # ✅ delete spinner
             except Exception:
                 pass
 
