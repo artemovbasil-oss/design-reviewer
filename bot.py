@@ -219,20 +219,30 @@ def channel_inline_kb() -> InlineKeyboardMarkup:
 
 
 # ----------------------------
-# Progress animation (compact + looping)
+# Progress animation (compact + more alive)
 # ----------------------------
 
+_SPIN = ["|", "/", "-", "\\"]  # pure ASCII, safe for Telegram HTML
+
 def retro_bar_frame(step: int, width: int = 16) -> str:
+    """
+    Compact 3-line retro widget:
+    - spinner animates in the top-left
+    - scanner bar moves (with tail)
+    - subtle blinking corners effect via alternating top line prefix
+    """
+    spin = _SPIN[step % len(_SPIN)]
     pos = step % width
     inside = ["·"] * width
+
     inside[pos] = "█"
     inside[(pos - 1) % width] = "▓"
     inside[(pos - 2) % width] = "▒"
-    return (
-        "┌" + "─" * width + "┐\n"
-        "│" + "".join(inside) + "│\n"
-        "└" + "─" * width + "┘"
-    )
+
+    top = f"{spin}┌" + "─" * width + "┐"
+    mid = " │" + "".join(inside) + "│"
+    bot = " └" + "─" * width + "┘"
+    return top + "\n" + mid + "\n" + bot
 
 
 async def animate_progress_until_done(
@@ -240,7 +250,7 @@ async def animate_progress_until_done(
     uid: int,
     title: str,
     done_event: asyncio.Event,
-    tick: float = 0.12,
+    tick: float = 0.10,  # a bit snappier
 ) -> Message:
     msg = await anchor.answer(
         f"{escape_html(title)}\n<code>{escape_html(retro_bar_frame(0))}</code>",
@@ -417,21 +427,22 @@ JSON schema:
 
     try:
         text = await asyncio.to_thread(llm_request_with_image, prompt, data_uri)
-        data = parse_json_safe(text)
-        return data
+        return parse_json_safe(text)
     except Exception:
         return None
 
 
 # ----------------------------
-# References (meaning-based, more precise + Pinterest)
+# References (simpler scope, no "intent guessing")
 # ----------------------------
 
 def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
     if _lang_is_ru(lang):
         return f"""
-Ты — старший продуктовый дизайнер. Подбери максимально точные референсы "по смыслу" (НЕ по визуалу).
-Верни СТРОГО JSON, без markdown.
+Ты — старший продуктовый дизайнер. Подбери референсы "по смыслу" (НЕ по визуалу).
+Не пытайся угадывать платформу/индустрию. Делай проще: паттерн + компоненты + намерение пользователя.
+
+Верни СТРОГО JSON (без markdown).
 
 Контекст:
 1) Что видишь: {what_i_see}
@@ -439,19 +450,11 @@ def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
 
 Выход (строго JSON):
 {{
-  "intent": {{
-    "product_domain": "fintech|ecommerce|travel|health|saas|marketplace|other",
-    "platform": "ios|android|web|unknown",
-    "journey_stage": "onboarding|auth|checkout|search|listing|details|settings|empty_state|other",
-    "primary_pattern": "коротко",
-    "key_components": ["..."],
-    "user_goal": "1 строка"
-  }},
   "items": [
     {{
-      "pattern": "название паттерна",
-      "why": "почему релевантно (1 строка)",
-      "what_to_look_for": ["3–5 must-have деталей"],
+      "pattern": "название паттерна (коротко)",
+      "why": "почему это подходит (1 строка)",
+      "what_to_look_for": ["3–5 конкретных признаков хорошего решения"],
       "example_products": ["Product A", "Product B", "Product C"],
       "search_keywords": ["точный запрос (EN)", "ещё запрос (EN)"]
     }}
@@ -460,14 +463,16 @@ def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
 
 Правила:
 - 5–7 items
-- search_keywords: только английский, максимально конкретно (platform + domain + pattern + component + constraint)
+- search_keywords: английский, но без 'ios/web/fintech/saas' — только паттерн + компонент + цель (коротко и конкретно)
 - example_products: реальные продукты/дизайн-системы/гайдлайны
 - Никаких ссылок. Только JSON.
 """.strip()
     else:
         return f"""
-You are a senior product designer. Find highly precise meaning-based references (not visually similar).
-Return STRICT JSON only. No markdown.
+You are a senior product designer. Provide meaning-based references (NOT visually similar).
+Do NOT guess platform/domain (no iOS/web/fintech/saas guessing). Keep it simple: pattern + components + user intent.
+
+Return STRICT JSON only (no markdown).
 
 Context:
 1) What you see: {what_i_see}
@@ -475,19 +480,11 @@ Context:
 
 Output (strict JSON):
 {{
-  "intent": {{
-    "product_domain": "fintech|ecommerce|travel|health|saas|marketplace|other",
-    "platform": "ios|android|web|unknown",
-    "journey_stage": "onboarding|auth|checkout|search|listing|details|settings|empty_state|other",
-    "primary_pattern": "short",
-    "key_components": ["..."],
-    "user_goal": "one line"
-  }},
   "items": [
     {{
-      "pattern": "pattern name",
+      "pattern": "pattern name (short)",
       "why": "why it fits (one line)",
-      "what_to_look_for": ["3–5 must-have traits"],
+      "what_to_look_for": ["3–5 concrete signals of a good solution"],
       "example_products": ["Product A", "Product B", "Product C"],
       "search_keywords": ["precise EN query", "another EN query"]
     }}
@@ -496,7 +493,7 @@ Output (strict JSON):
 
 Rules:
 - 5–7 items
-- search_keywords: English only, very specific (platform + domain + pattern + component + constraint)
+- search_keywords: English, but no 'ios/web/fintech/saas' — only pattern + component + intent (short & concrete)
 - example_products: real products / design systems / guidelines
 - No links. JSON only.
 """.strip()
@@ -519,10 +516,34 @@ def _make_link(title: str, url: str) -> str:
     return f'• <a href="{url}">{title}</a>'
 
 
+def _normalize_keywords(keywords: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    for k in (keywords or []):
+        k = str(k).strip()
+        if not k:
+            continue
+        # keep short and safe
+        k = re.sub(r"\s+", " ", k)
+        if len(k) > 80:
+            k = k[:80]
+        cleaned.append(k)
+    # dedupe preserving order
+    out: List[str] = []
+    seen = set()
+    for k in cleaned:
+        if k.lower() in seen:
+            continue
+        seen.add(k.lower())
+        out.append(k)
+    return out[:3]
+
+
 def build_reference_links(keywords: List[str]) -> List[str]:
-    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
-    picked = kws[:2]
-    q = quote_plus(" ".join(picked)) if picked else ""
+    # Better “scope”: we do NOT add domain/platform guesses.
+    # We simply search for: (keyword) + "ui pattern" or keep keywords as-is.
+    kws = _normalize_keywords(keywords)
+    q_base = " ".join(kws).strip()
+    q = quote_plus(q_base) if q_base else ""
 
     links: List[str] = []
     if q:
@@ -531,10 +552,10 @@ def build_reference_links(keywords: List[str]) -> List[str]:
         links.append(_make_link("Google (pattern)", f"https://www.google.com/search?q={q}+ui+pattern"))
         links.append(_make_link("Google Images", f"https://www.google.com/search?tbm=isch&q={q}+ui"))
 
+    # “Stable” sources (not repeating GOV.UK every time)
     links.append(_make_link("Nielsen Norman Group", "https://www.nngroup.com/articles/"))
     links.append(_make_link("Material Design", "https://m3.material.io/components"))
     links.append(_make_link("Apple HIG", "https://developer.apple.com/design/human-interface-guidelines/"))
-    links.append(_make_link("GOV.UK Design System", "https://design-system.service.gov.uk/"))
 
     return links
 
@@ -550,15 +571,6 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
 
     lines: List[str] = [f"<b>{escape_html(title)}</b>", f"<i>{escape_html(subtitle)}</i>"]
 
-    intent = (refs or {}).get("intent", {})
-    if isinstance(intent, dict):
-        pd = str(intent.get("product_domain") or "").strip()
-        st = str(intent.get("journey_stage") or "").strip()
-        pp = str(intent.get("primary_pattern") or "").strip()
-        parts = [p for p in [pd, st, pp] if p]
-        if parts:
-            lines.append(f"\n<i>{escape_html(' / '.join(parts))}</i>")
-
     for i, it in enumerate(items, 1):
         if not isinstance(it, dict):
             continue
@@ -573,7 +585,7 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
         w = it.get("what_to_look_for") or []
         w = [str(x).strip() for x in w if str(x).strip()][:5]
         kws = it.get("search_keywords") or []
-        kws = [str(x).strip() for x in kws if str(x).strip()][:4]
+        kws = _normalize_keywords(kws)
 
         lines.append(f"\n<b>{i}) {escape_html(pattern)}</b>")
         if why:
@@ -586,8 +598,12 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
         link_lines = build_reference_links(kws)
         if link_lines:
             lines.append(f"<u>{escape_html(t(uid,'label_links'))}</u>")
-            # compact set: top 3 + a stable one
-            lines.extend(link_lines[:3] + link_lines[-1:])
+            # compact: 3 search + 1 stable
+            if kws:
+                lines.extend(link_lines[:3] + link_lines[-1:])
+            else:
+                # if no keywords, show only stable ones
+                lines.extend(link_lines[-3:])
 
     return "\n".join(lines).strip()
 
@@ -628,7 +644,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             uid,
             title=t(uid, "progress_title"),
             done_event=done,
-            tick=0.12,
+            tick=0.10,
         )
     )
 
@@ -698,7 +714,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
                 uid,
                 title=t(uid, "progress_wire"),
                 done_event=done2,
-                tick=0.12,
+                tick=0.10,
             )
         )
 
@@ -734,7 +750,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
                 uid,
                 title=t(uid, "progress_refs"),
                 done_event=done3,
-                tick=0.12,
+                tick=0.10,
             )
         )
 
