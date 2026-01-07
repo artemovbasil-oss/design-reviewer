@@ -1,16 +1,17 @@
 # bot.py
 # Design Reviewer Telegram bot (Aiogram 3.7+)
 # - Accepts screenshots (photos) and public Figma links (via oEmbed thumbnail)
-# - Shows compact retro ASCII progress animation (loops until done) + deletes spinner message after completion
+# - Shows compact retro ASCII progress animation (loops until done)
 # - Sends outputs:
 #   1) What I see
-#   2) Verdict + recommendations (more concrete, no font guessing)
+#   2) Verdict + recommendations
 #   3) ASCII wireframe concept (monospace, width-limited to avoid mobile wrapping)
-#   4) References block (meaning-based; patterns + example products + ONLY 3 search links; no images)
+#   4) References block (meaning-based; patterns + example products + Pinterest/Dribbble links; no images)
 # - EN by default, RU toggle
 # - Menu shown only after /start and at the end of each review
 # - Cancel button works during processing
 # - Annotated screenshot is DISABLED
+# - Admin-only Stats button + /stats (admin = @uxd_ink)
 
 import asyncio
 import base64
@@ -18,6 +19,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import time
 import urllib.parse
 import urllib.request
@@ -51,6 +53,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
 
+# Admin username (without @)
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "uxd_ink").strip().lstrip("@").lower()
+
+# SQLite path (Railway: can set to /data/bot_stats.db if you mount a volume)
+SQLITE_PATH = os.getenv("SQLITE_PATH", "bot_stats.db").strip()
+
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN in environment (Railway Variables or local export).")
 
@@ -64,6 +72,123 @@ client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 LANG: Dict[int, str] = {}  # user_id -> "en" / "ru"
 CANCEL_FLAGS: Dict[int, bool] = {}  # user_id -> True when cancelled
 RUNNING_TASK: Dict[int, asyncio.Task] = {}  # user_id -> running processing task
+
+# Remember last known usernames for UI decisions (admin stats button)
+USERNAMES: Dict[int, str] = {}  # user_id -> username (lower)
+
+
+# ----------------------------
+# DB (SQLite, zero deps)
+# ----------------------------
+
+_db_lock = asyncio.Lock()
+_db = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+_db.execute(
+    """
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  username TEXT,
+  lang TEXT,
+  event TEXT NOT NULL,
+  input_type TEXT,
+  duration_ms INTEGER,
+  score INTEGER,
+  error TEXT
+)
+"""
+)
+_db.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
+_db.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id)")
+_db.commit()
+
+
+def _now_ts() -> int:
+    return int(time.time())
+
+
+async def log_event(
+    *,
+    user_id: int,
+    username: str,
+    lang: str,
+    event: str,
+    input_type: Optional[str] = None,
+    duration_ms: Optional[int] = None,
+    score: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    # Keep it robust: never crash bot because of analytics
+    try:
+        async with _db_lock:
+            _db.execute(
+                """
+                INSERT INTO events (ts, user_id, username, lang, event, input_type, duration_ms, score, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _now_ts(),
+                    int(user_id),
+                    (username or "").strip()[:64],
+                    (lang or "en").strip()[:8],
+                    (event or "").strip()[:64],
+                    (input_type or None),
+                    int(duration_ms) if duration_ms is not None else None,
+                    int(score) if score is not None else None,
+                    (error or None),
+                ),
+            )
+            _db.commit()
+    except Exception:
+        pass
+
+
+async def get_stats_summary() -> Dict[str, Any]:
+    async with _db_lock:
+        now = _now_ts()
+        day = now - 24 * 3600
+        week = now - 7 * 24 * 3600
+
+        def q(sql: str, params=()):
+            cur = _db.execute(sql, params)
+            row = cur.fetchone()
+            return row[0] if row else 0
+
+        total_users = q("SELECT COUNT(DISTINCT user_id) FROM events")
+        total_reviews = q("SELECT COUNT(*) FROM events WHERE event='review_done'")
+        reviews_24h = q("SELECT COUNT(*) FROM events WHERE event='review_done' AND ts>=?", (day,))
+        reviews_7d = q("SELECT COUNT(*) FROM events WHERE event='review_done' AND ts>=?", (week,))
+        cancels_7d = q("SELECT COUNT(*) FROM events WHERE event='review_cancelled' AND ts>=?", (week,))
+        fails_7d = q("SELECT COUNT(*) FROM events WHERE event='review_failed' AND ts>=?", (week,))
+        photo_7d = q("SELECT COUNT(*) FROM events WHERE event='review_done' AND input_type='photo' AND ts>=?", (week,))
+        figma_7d = q("SELECT COUNT(*) FROM events WHERE event='review_done' AND input_type='figma' AND ts>=?", (week,))
+
+        # Top errors (last 7d)
+        cur = _db.execute(
+            """
+            SELECT error, COUNT(*) as c
+            FROM events
+            WHERE event='review_failed' AND ts>=? AND error IS NOT NULL
+            GROUP BY error
+            ORDER BY c DESC
+            LIMIT 5
+            """,
+            (week,),
+        )
+        top_errors = [(r[0], r[1]) for r in cur.fetchall()]
+
+    return {
+        "total_users": total_users,
+        "total_reviews": total_reviews,
+        "reviews_24h": reviews_24h,
+        "reviews_7d": reviews_7d,
+        "cancels_7d": cancels_7d,
+        "fails_7d": fails_7d,
+        "photo_7d": photo_7d,
+        "figma_7d": figma_7d,
+        "top_errors": top_errors,
+    }
 
 
 # ----------------------------
@@ -89,6 +214,16 @@ def escape_html(s: str) -> str:
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def is_admin_message(m: Message) -> bool:
+    u = (m.from_user.username or "").strip().lower()
+    return u == ADMIN_USERNAME
+
+
+def is_admin_uid(uid: int) -> bool:
+    u = USERNAMES.get(uid, "").lower()
+    return u == ADMIN_USERNAME
 
 
 TXT = {
@@ -126,6 +261,7 @@ TXT = {
         "menu_how": "How it works?",
         "menu_lang": "Language: EN/RU",
         "menu_channel": "@prodooktovy",
+        "menu_stats": "Stats",
         "btn_cancel": "Cancel",
         "progress_title": "Review in progress",
         "progress_wire": "Drafting wireframe",
@@ -136,9 +272,6 @@ TXT = {
         "label_examples": "Examples:",
         "label_look": "Look for:",
         "label_links": "Links:",
-        "link_pinterest": "Pinterest",
-        "link_dribbble": "Dribbble",
-        "link_google": "Google (pattern)",
     },
     "ru": {
         "title": "Design Reviewer",
@@ -174,6 +307,7 @@ TXT = {
         "menu_how": "Как это работает?",
         "menu_lang": "Язык: EN/RU",
         "menu_channel": "@prodooktovy",
+        "menu_stats": "Статистика",
         "btn_cancel": "Cancel",
         "progress_title": "Ревью в процессе",
         "progress_wire": "Собираю wireframe",
@@ -184,9 +318,6 @@ TXT = {
         "label_examples": "Примеры:",
         "label_look": "Смотри в референсах:",
         "label_links": "Ссылки:",
-        "link_pinterest": "Pinterest",
-        "link_dribbble": "Dribbble",
-        "link_google": "Google (pattern)",
     },
 }
 
@@ -200,12 +331,17 @@ def t(uid: int, key: str) -> str:
 # ----------------------------
 
 def main_menu_kb(uid: int) -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(text=t(uid, "menu_submit"))],
+        [KeyboardButton(text=t(uid, "menu_how"))],
+    ]
+    if is_admin_uid(uid):
+        keyboard.append([KeyboardButton(text=t(uid, "menu_stats"))])
+
+    keyboard.append([KeyboardButton(text=t(uid, "menu_channel")), KeyboardButton(text=t(uid, "menu_lang"))])
+
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=t(uid, "menu_submit"))],
-            [KeyboardButton(text=t(uid, "menu_how"))],
-            [KeyboardButton(text=t(uid, "menu_channel")), KeyboardButton(text=t(uid, "menu_lang"))],
-        ],
+        keyboard=keyboard,
         resize_keyboard=True,
         selective=True,
         input_field_placeholder=t(uid, "need_input"),
@@ -225,42 +361,32 @@ def channel_inline_kb() -> InlineKeyboardMarkup:
 
 
 # ----------------------------
-# Progress animation (compact + richer movement)
+# Progress animation (compact + looping)
 # ----------------------------
 
-_SPIN = ["|", "/", "-", "\\"]  # safe ASCII
-_TICK = ["·", "•", "·", "•"]
+def retro_bar_frame(step: int, width: int = 16) -> str:
+    # more “alive” retro bar: bouncing head + shimmer
+    pos = step % (width * 2 - 2)
+    if pos >= width:
+        pos = (width * 2 - 2) - pos
 
-def retro_bar_frame(step: int, width: int = 18) -> str:
-    """
-    3-line compact retro HUD:
-    - moving "scanner" with trail
-    - a second element moving opposite direction
-    - spinner + "tick" symbol to feel alive
-    """
-    spin = _SPIN[step % 4]
-    tick = _TICK[step % 4]
+    palette = ["·", "·", "·", "·", "·"]
+    inside = [palette[(i + step) % len(palette)] for i in range(width)]
+    inside[pos] = "█"
+    if pos - 1 >= 0:
+        inside[pos - 1] = "▓"
+    if pos - 2 >= 0:
+        inside[pos - 2] = "▒"
+    if pos + 1 < width:
+        inside[pos + 1] = "▓"
+    if pos + 2 < width:
+        inside[pos + 2] = "▒"
 
-    p1 = step % width
-    p2 = (width - 1) - (step % width)
-
-    cells = ["·"] * width
-
-    # scanner 1
-    cells[p1] = "█"
-    cells[(p1 - 1) % width] = "▓"
-    cells[(p1 - 2) % width] = "▒"
-
-    # scanner 2 (opposite)
-    if cells[p2] == "·":
-        cells[p2] = "■"
-    elif cells[p2] in ("▒", "▓"):
-        cells[p2] = "█"
-
-    top = f"{spin}{tick}┌" + "─" * width + "┐"
-    mid = "  │" + "".join(cells) + "│"
-    bot = "  └" + "─" * width + "┘"
-    return top + "\n" + mid + "\n" + bot
+    return (
+        "┌" + "─" * width + "┐\n"
+        "│" + "".join(inside) + "│\n"
+        "└" + "─" * width + "┘"
+    )
 
 
 async def animate_progress_until_done(
@@ -268,7 +394,7 @@ async def animate_progress_until_done(
     uid: int,
     title: str,
     done_event: asyncio.Event,
-    tick: float = 0.10,
+    tick: float = 0.12,
 ) -> Message:
     msg = await anchor.answer(
         f"{escape_html(title)}\n<code>{escape_html(retro_bar_frame(0))}</code>",
@@ -289,17 +415,13 @@ async def animate_progress_until_done(
             pass
         await asyncio.sleep(tick)
 
-    return msg
-
-
-async def safe_delete_message(msg: Optional[Message]) -> None:
-    if not msg:
-        return
+    # Optional: remove inline keyboard when done (Telegram doesn't let you delete other bot msgs reliably)
     try:
-        await msg.delete()
+        await msg.edit_reply_markup(reply_markup=None)
     except Exception:
-        # can't delete (permissions / too old / etc.)
         pass
+
+    return msg
 
 
 # ----------------------------
@@ -422,28 +544,25 @@ async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional
     language = lang_for(uid)
     data_uri = img_to_data_uri_png(img_bytes)
 
-    # No font guessing. More concrete: hierarchy, spacing, CTA, copy, states, accessibility.
+    # Note: We removed font-guessing. We ask for more concrete, actionable notes instead.
     prompt = f"""
 You are a tough-but-fair senior product designer doing a design review.
 
 Return ONLY valid JSON. No markdown. No extra keys.
 
 Language: "{language}" ("en" or "ru").
-Be honest. No profanity.
+Be honest, no profanity.
 
 Tasks:
 1) Describe what you see on the screenshot (short, concrete).
-2) Give verdict + recommendations (actionable, concrete).
-   - Do NOT guess font families.
-   - Avoid exact pixels and hex colors.
-   - Be specific: name UI parts (header, primary CTA, input, helper text, error state, empty state, list rows, cards).
-   - Include: hierarchy, spacing, CTA clarity, copy improvements, states (loading/error/disabled), accessibility (contrast, tap targets).
-   - If something is good, say what exactly.
+2) Give verdict + recommendations (actionable, more concrete):
+   - Point to specific UI parts by name (header, primary CTA, form fields, error states, pricing block, etc.)
+   - Include quick priority tags like [P0]/[P1]/[P2] inside the verdict text.
+   - Avoid guessing fonts or hex colors.
 3) Provide a score from 1 to 10 (integer).
-4) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} chars per line.
+4) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} characters per line.
    - Provide as an array of strings (ascii_concept).
    - Each line MUST be <= {ascii_w} chars.
-   - Make it a meaningful wireframe: structure + key components + CTA placement.
 
 JSON schema:
 {{
@@ -465,16 +584,14 @@ JSON schema:
 
 
 # ----------------------------
-# References (simpler scope, ONLY 3 search links)
+# References (meaning-based + Pinterest; simplified scope)
 # ----------------------------
 
 def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
     if _lang_is_ru(lang):
         return f"""
-Ты — старший продуктовый дизайнер. Подбери референсы "по смыслу" (НЕ по визуалу).
-Не угадывай платформу/индустрию. Сфокусируйся на паттерне, компонентах, цели пользователя.
-
-Верни СТРОГО JSON (без markdown).
+Ты — старший продуктовый дизайнер. Подбери точные референсы "по смыслу" (НЕ по визуалу).
+Верни СТРОГО JSON, без markdown.
 
 Контекст:
 1) Что видишь: {what_i_see}
@@ -484,9 +601,9 @@ def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
 {{
   "items": [
     {{
-      "pattern": "название паттерна (коротко)",
-      "why": "почему это подходит (1 строка)",
-      "what_to_look_for": ["3–5 конкретных признаков хорошего решения"],
+      "pattern": "название паттерна",
+      "why": "почему релевантно (1 строка)",
+      "what_to_look_for": ["3–5 деталей"],
       "example_products": ["Product A", "Product B", "Product C"],
       "search_keywords": ["точный запрос (EN)", "ещё запрос (EN)"]
     }}
@@ -495,16 +612,15 @@ def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
 
 Правила:
 - 5–7 items
-- search_keywords: английский, коротко и конкретно. Не добавляй 'ios/web/fintech/saas'.
+- НЕ пытайся угадать домен/платформу. Просто делай максимально точные ключевые запросы (EN) по паттерну и компонентам.
+- search_keywords: английский, конкретно (pattern + components + constraint)
 - example_products: реальные продукты/дизайн-системы/гайдлайны
 - Никаких ссылок. Только JSON.
 """.strip()
     else:
         return f"""
-You are a senior product designer. Provide meaning-based references (NOT visually similar).
-Do NOT guess platform/domain. Focus on pattern, components, user intent.
-
-Return STRICT JSON only (no markdown).
+You are a senior product designer. Find precise meaning-based references (not visually similar).
+Return STRICT JSON only. No markdown.
 
 Context:
 1) What you see: {what_i_see}
@@ -514,9 +630,9 @@ Output (strict JSON):
 {{
   "items": [
     {{
-      "pattern": "pattern name (short)",
+      "pattern": "pattern name",
       "why": "why it fits (one line)",
-      "what_to_look_for": ["3–5 concrete signals of a good solution"],
+      "what_to_look_for": ["3–5 traits"],
       "example_products": ["Product A", "Product B", "Product C"],
       "search_keywords": ["precise EN query", "another EN query"]
     }}
@@ -525,8 +641,7 @@ Output (strict JSON):
 
 Rules:
 - 5–7 items
-- search_keywords: English, short & concrete. Do not add 'ios/web/fintech/saas'.
-- example_products: real products / design systems / guidelines
+- Don't guess domain/platform. Focus on very specific EN queries (pattern + components + constraints).
 - No links. JSON only.
 """.strip()
 
@@ -548,40 +663,18 @@ def _make_link(title: str, url: str) -> str:
     return f'• <a href="{url}">{title}</a>'
 
 
-def _normalize_keywords(keywords: List[str]) -> List[str]:
-    cleaned: List[str] = []
-    for k in (keywords or []):
-        k = str(k).strip()
-        if not k:
-            continue
-        k = re.sub(r"\s+", " ", k)
-        if len(k) > 80:
-            k = k[:80]
-        cleaned.append(k)
-    out: List[str] = []
-    seen = set()
-    for k in cleaned:
-        kl = k.lower()
-        if kl in seen:
-            continue
-        seen.add(kl)
-        out.append(k)
-    return out[:3]
-
-
-def build_reference_links(uid: int, keywords: List[str]) -> List[str]:
-    kws = _normalize_keywords(keywords)
-    q_base = " ".join(kws).strip()
-    q = quote_plus(q_base) if q_base else ""
-
+def build_reference_links(keywords: List[str]) -> List[str]:
+    kws = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    picked = kws[:2]
+    q = quote_plus(" ".join(picked)) if picked else ""
     if not q:
-        return []
+        q = quote_plus("ux ui pattern")
 
-    # ONLY 3 links (as requested)
+    # Only 3 searches (as you requested)
     return [
-        _make_link(t(uid, "link_pinterest"), f"https://www.pinterest.com/search/pins/?q={q}"),
-        _make_link(t(uid, "link_dribbble"), f"https://dribbble.com/search/{q}"),
-        _make_link(t(uid, "link_google"), f"https://www.google.com/search?q={q}+ui+pattern"),
+        _make_link("Pinterest", f"https://www.pinterest.com/search/pins/?q={q}"),
+        _make_link("Dribbble", f"https://dribbble.com/search/{q}"),
+        _make_link("Google (pattern)", f"https://www.google.com/search?q={q}+ui+pattern"),
     ]
 
 
@@ -599,7 +692,6 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
     for i, it in enumerate(items, 1):
         if not isinstance(it, dict):
             continue
-
         pattern = str(it.get("pattern") or "").strip()
         if not pattern:
             continue
@@ -609,7 +701,8 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
         ex = [str(x).strip() for x in ex if str(x).strip()][:4]
         w = it.get("what_to_look_for") or []
         w = [str(x).strip() for x in w if str(x).strip()][:5]
-        kws = _normalize_keywords(it.get("search_keywords") or [])
+        kws = it.get("search_keywords") or []
+        kws = [str(x).strip() for x in kws if str(x).strip()][:4]
 
         lines.append(f"\n<b>{i}) {escape_html(pattern)}</b>")
         if why:
@@ -619,10 +712,9 @@ def format_refs_block(uid: int, refs: Dict[str, Any]) -> str:
         if ex:
             lines.append(f"{escape_html(t(uid,'label_examples'))} {escape_html(', '.join(ex))}")
 
-        link_lines = build_reference_links(uid, kws)
-        if link_lines:
-            lines.append(f"<u>{escape_html(t(uid,'label_links'))}</u>")
-            lines.extend(link_lines)
+        link_lines = build_reference_links(kws)
+        lines.append(f"<u>{escape_html(t(uid,'label_links'))}</u>")
+        lines.extend(link_lines)
 
     return "\n".join(lines).strip()
 
@@ -653,8 +745,13 @@ async def send_channel(uid: int, m: Message) -> None:
     await m.answer(escape_html(text), reply_markup=channel_inline_kb())
 
 
-async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> None:
+async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, input_type: str) -> None:
     CANCEL_FLAGS[uid] = False
+    username = USERNAMES.get(uid, "")
+    lang = lang_for(uid)
+
+    t0 = time.time()
+    await log_event(user_id=uid, username=username, lang=lang, event="review_started", input_type=input_type)
 
     done = asyncio.Event()
     spinner_task = asyncio.create_task(
@@ -663,20 +760,15 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             uid,
             title=t(uid, "progress_title"),
             done_event=done,
-            tick=0.10,
+            tick=0.12,
         )
     )
-    spinner_msg: Optional[Message] = None
 
     try:
         if not client:
             done.set()
-            try:
-                spinner_msg = await spinner_task
-                await safe_delete_message(spinner_msg)
-            except Exception:
-                pass
             await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_failed", input_type=input_type, error="no_openai_key")
             return
 
         ascii_w = compute_ascii_width_for_mobile(img_bytes)
@@ -684,23 +776,26 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
 
         done.set()
         try:
-            spinner_msg = await spinner_task
-            await safe_delete_message(spinner_msg)  # ✅ delete spinner after done
+            await spinner_task
         except Exception:
             pass
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
             return
 
         if not result:
             await message.answer(escape_html(t(uid, "llm_fail")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_failed", input_type=input_type, error="llm_no_json")
             return
 
         if result.get("error") == "no_llm":
             await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_failed", input_type=input_type, error="no_llm")
             return
 
+        # enforce language
         result["language"] = lang_for(uid)
 
         try:
@@ -722,6 +817,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
             return
 
         # 2) Verdict
@@ -730,6 +826,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
             return
 
         # 3) ASCII wireframe (spinner)
@@ -740,10 +837,9 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
                 uid,
                 title=t(uid, "progress_wire"),
                 done_event=done2,
-                tick=0.10,
+                tick=0.12,
             )
         )
-        spinner2_msg: Optional[Message] = None
 
         try:
             width = int(result.get("ascii_width") or ascii_w)
@@ -758,8 +854,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
         finally:
             done2.set()
             try:
-                spinner2_msg = await spinner2
-                await safe_delete_message(spinner2_msg)  # ✅ delete spinner
+                await spinner2
             except Exception:
                 pass
 
@@ -768,6 +863,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
             return
 
         # 4) References (spinner)
@@ -778,23 +874,22 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
                 uid,
                 title=t(uid, "progress_refs"),
                 done_event=done3,
-                tick=0.10,
+                tick=0.12,
             )
         )
-        spinner3_msg: Optional[Message] = None
 
         try:
             refs = await llm_build_references(uid, what_i_see_text, verdict_text)
         finally:
             done3.set()
             try:
-                spinner3_msg = await spinner3
-                await safe_delete_message(spinner3_msg)  # ✅ delete spinner
+                await spinner3
             except Exception:
                 pass
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
             return
 
         if not refs or refs.get("error") == "no_llm":
@@ -803,9 +898,30 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int) -> N
             refs_msg = format_refs_block(uid, refs)
             await message.answer(refs_msg, disable_web_page_preview=True)
 
-        # menu at the end
+        # end menu
         await message.answer(escape_html(t(uid, "need_input")), reply_markup=main_menu_kb(uid))
 
+        dur_ms = int((time.time() - t0) * 1000)
+        await log_event(
+            user_id=uid,
+            username=username,
+            lang=lang,
+            event="review_done",
+            input_type=input_type,
+            duration_ms=dur_ms,
+            score=score_int,
+        )
+
+    except asyncio.CancelledError:
+        # cancelled by user
+        await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
+        raise
+    except Exception as e:
+        try:
+            await message.answer(escape_html(t(uid, "llm_fail")), reply_markup=main_menu_kb(uid))
+        except Exception:
+            pass
+        await log_event(user_id=uid, username=username, lang=lang, event="review_failed", input_type=input_type, error=str(e)[:200])
     finally:
         done.set()
         if not spinner_task.done():
@@ -846,8 +962,12 @@ async def on_cancel(cb: CallbackQuery):
 @router.message(CommandStart())
 async def on_start(m: Message):
     uid = m.from_user.id
+    USERNAMES[uid] = (m.from_user.username or "").strip().lower()
+
     if uid not in LANG:
         set_lang(uid, "en")
+
+    await log_event(user_id=uid, username=USERNAMES[uid], lang=lang_for(uid), event="start")
 
     await m.answer(
         escape_html(t(uid, "start")),
@@ -858,8 +978,51 @@ async def on_start(m: Message):
 @router.message(F.text)
 async def on_text(m: Message, bot: Bot):
     uid = m.from_user.id
+    USERNAMES[uid] = (m.from_user.username or "").strip().lower()
+
     txt = (m.text or "").strip()
 
+    # admin-only stats via button
+    if txt == t(uid, "menu_stats"):
+        if not is_admin_message(m):
+            return
+        s = await get_stats_summary()
+        msg = (
+            "<b>Stats</b>\n"
+            f"Users: <b>{s['total_users']}</b>\n"
+            f"Reviews (total): <b>{s['total_reviews']}</b>\n\n"
+            f"Reviews 24h: <b>{s['reviews_24h']}</b>\n"
+            f"Reviews 7d: <b>{s['reviews_7d']}</b>\n"
+            f"7d by type: photo <b>{s['photo_7d']}</b> / figma <b>{s['figma_7d']}</b>\n"
+            f"7d cancels: <b>{s['cancels_7d']}</b>\n"
+            f"7d fails: <b>{s['fails_7d']}</b>\n"
+        )
+        if s["top_errors"]:
+            msg += "\n<b>Top errors (7d)</b>\n"
+            for e, c in s["top_errors"]:
+                msg += f"• {escape_html(str(e))} — {c}\n"
+        await m.answer(msg, reply_markup=main_menu_kb(uid))
+        return
+
+    # /stats command
+    if txt.lower() == "/stats":
+        if not is_admin_message(m):
+            return
+        s = await get_stats_summary()
+        msg = (
+            "<b>Stats</b>\n"
+            f"Users: <b>{s['total_users']}</b>\n"
+            f"Reviews (total): <b>{s['total_reviews']}</b>\n\n"
+            f"Reviews 24h: <b>{s['reviews_24h']}</b>\n"
+            f"Reviews 7d: <b>{s['reviews_7d']}</b>\n"
+            f"7d by type: photo <b>{s['photo_7d']}</b> / figma <b>{s['figma_7d']}</b>\n"
+            f"7d cancels: <b>{s['cancels_7d']}</b>\n"
+            f"7d fails: <b>{s['fails_7d']}</b>\n"
+        )
+        await m.answer(msg, reply_markup=main_menu_kb(uid))
+        return
+
+    # menu actions
     if txt == t(uid, "menu_how"):
         await m.answer(escape_html(t(uid, "how")), reply_markup=main_menu_kb(uid))
         return
@@ -878,6 +1041,7 @@ async def on_text(m: Message, bot: Bot):
         await m.answer(escape_html(t(uid, "need_input")))
         return
 
+    # figma link
     if is_figma_link(txt):
         if RUNNING_TASK.get(uid) and not RUNNING_TASK[uid].done():
             await m.answer(escape_html(t(uid, "busy")))
@@ -888,6 +1052,7 @@ async def on_text(m: Message, bot: Bot):
             await m.answer(escape_html(t(uid, "figma_fetch_fail")), reply_markup=main_menu_kb(uid))
             return
 
+        # preview
         try:
             photo = BufferedInputFile(thumb, filename="figma_preview.png")
             await m.answer_photo(photo=photo, caption=escape_html(t(uid, "preview")))
@@ -895,7 +1060,7 @@ async def on_text(m: Message, bot: Bot):
             pass
 
         async def _run():
-            await do_review(m, bot, thumb, uid)
+            await do_review(m, bot, thumb, uid, input_type="figma")
 
         task = asyncio.create_task(_run())
         RUNNING_TASK[uid] = task
@@ -907,6 +1072,7 @@ async def on_text(m: Message, bot: Bot):
 @router.message(F.photo)
 async def on_photo(m: Message, bot: Bot):
     uid = m.from_user.id
+    USERNAMES[uid] = (m.from_user.username or "").strip().lower()
 
     if RUNNING_TASK.get(uid) and not RUNNING_TASK[uid].done():
         await m.answer(escape_html(t(uid, "busy")))
@@ -918,7 +1084,7 @@ async def on_photo(m: Message, bot: Bot):
     data = img_bytes.read() if hasattr(img_bytes, "read") else bytes(img_bytes)
 
     async def _run():
-        await do_review(m, bot, data, uid)
+        await do_review(m, bot, data, uid, input_type="photo")
 
     task = asyncio.create_task(_run())
     RUNNING_TASK[uid] = task
