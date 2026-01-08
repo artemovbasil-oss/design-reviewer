@@ -12,6 +12,12 @@
 # - Cancel button works during processing
 # - Annotated screenshot is DISABLED
 # - Admin-only Stats button + /stats (admin = @uxd_ink)
+#
+# CHANGES in this version:
+# - Removed priority tags [P0]/[P1]/[P2] from review output (prompt + sanitizer)
+# - Made verdict stricter + more structured (highlights flaws better)
+# - Fixed "score always 7/10" by removing anchoring example score_10: 7 -> 0 + rubric
+# - Added optional temperature control via env LLM_TEMPERATURE (default 0.7)
 
 import asyncio
 import base64
@@ -52,6 +58,7 @@ from openai import OpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))  # NEW
 
 # Admin username (without @)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "uxd_ink").strip().lstrip("@").lower()
@@ -192,7 +199,7 @@ async def get_stats_summary() -> Dict[str, Any]:
 
 
 # ----------------------------
-# Helpers: i18n + HTML escaping
+# Helpers: i18n + HTML escaping + priority-tag sanitizer
 # ----------------------------
 
 def lang_for(uid: int) -> str:
@@ -224,6 +231,17 @@ def is_admin_message(m: Message) -> bool:
 def is_admin_uid(uid: int) -> bool:
     u = USERNAMES.get(uid, "").lower()
     return u == ADMIN_USERNAME
+
+
+# NEW: Strip any leftover priority tags if the model outputs them
+_PRI_RE = re.compile(r"\s*\[(?:P0|P1|P2|P3)\]\s*", re.IGNORECASE)
+
+
+def strip_priority_tags(text: str) -> str:
+    text = (text or "").strip()
+    text = _PRI_RE.sub(" ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
 
 
 TXT = {
@@ -512,6 +530,7 @@ def llm_request_with_image(prompt_text: str, data_uri: str) -> str:
 
     resp = client.responses.create(
         model=LLM_MODEL,
+        temperature=LLM_TEMPERATURE,  # NEW
         input=[{
             "role": "user",
             "content": [
@@ -529,6 +548,7 @@ def llm_request_text_only(prompt_text: str) -> str:
 
     resp = client.responses.create(
         model=LLM_MODEL,
+        temperature=LLM_TEMPERATURE,  # NEW
         input=[{
             "role": "user",
             "content": [{"type": "input_text", "text": prompt_text}],
@@ -544,22 +564,46 @@ async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional
     language = lang_for(uid)
     data_uri = img_to_data_uri_png(img_bytes)
 
-    # Note: We removed font-guessing. We ask for more concrete, actionable notes instead.
+    # NEW: stricter prompt + no priority tags + no score anchoring
     prompt = f"""
-You are a tough-but-fair senior product designer doing a design review.
+You are a strict senior product designer doing a design review.
 
 Return ONLY valid JSON. No markdown. No extra keys.
 
 Language: "{language}" ("en" or "ru").
-Be honest, no profanity.
+Be blunt but professional. No profanity.
 
 Tasks:
-1) Describe what you see on the screenshot (short, concrete).
-2) Give verdict + recommendations (actionable, more concrete):
-   - Point to specific UI parts by name (header, primary CTA, form fields, error states, pricing block, etc.)
-   - Include quick priority tags like [P0]/[P1]/[P2] inside the verdict text.
-   - Avoid guessing fonts or hex colors.
-3) Provide a score from 1 to 10 (integer).
+1) Describe what you see on the screenshot (short, factual).
+2) Provide a strict verdict with clearly highlighted flaws and concrete fixes.
+   Structure the verdict exactly like this:
+
+   Biggest problem: <one sentence>
+
+   Critical issues:
+   - <3–5 bullets, what breaks usability/conversion>
+
+   UX/UI issues:
+   - <3–6 bullets, hierarchy, clarity, spacing, states, copy>
+
+   Fix plan (next iteration):
+   - <3–6 bullets, concrete edits and ordering of blocks>
+
+   Copy fixes:
+   - <2–4 examples "Before → After">
+
+   Rules:
+   - DO NOT use priority tags like [P0]/[P1]/[P2] or any brackets marking priority.
+   - Do NOT guess fonts or hex colors.
+   - Refer to UI parts by name (header, primary CTA, form fields, tabs, pricing block, errors, empty state, etc.)
+
+3) Provide a score from 1 to 10 (integer) using rubric:
+   1–3: broken/confusing; major issues everywhere
+   4–6: works but weak; serious clarity/hierarchy issues
+   7–8: solid; several fixable issues
+   9–10: excellent; minor polish only
+   IMPORTANT: do not default to 7. Pick the score that matches the rubric.
+
 4) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} characters per line.
    - Provide as an array of strings (ascii_concept).
    - Each line MUST be <= {ascii_w} chars.
@@ -567,7 +611,7 @@ Tasks:
 JSON schema:
 {{
   "language": "{language}",
-  "score_10": 7,
+  "score_10": 0,
   "what_i_see": "...",
   "verdict": "...",
   "ascii_width": {ascii_w},
@@ -768,7 +812,14 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
         if not client:
             done.set()
             await message.answer(escape_html(t(uid, "no_llm")), reply_markup=main_menu_kb(uid))
-            await log_event(user_id=uid, username=username, lang=lang, event="review_failed", input_type=input_type, error="no_openai_key")
+            await log_event(
+                user_id=uid,
+                username=username,
+                lang=lang,
+                event="review_failed",
+                input_type=input_type,
+                error="no_openai_key",
+            )
             return
 
         ascii_w = compute_ascii_width_for_mobile(img_bytes)
@@ -805,7 +856,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
         score_int = max(1, min(10, score_int))
 
         what_i_see_text = str(result.get("what_i_see", "")).strip()
-        verdict_text = str(result.get("verdict", "")).strip()
+        verdict_text = strip_priority_tags(str(result.get("verdict", "")).strip())  # NEW
 
         # 1) What I see
         msg1 = (
