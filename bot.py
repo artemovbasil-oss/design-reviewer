@@ -3,9 +3,10 @@
 # - Accepts screenshots (photos) and public Figma links (via oEmbed thumbnail)
 # - Shows compact retro ASCII progress animation (loops until done)
 # - Sends outputs:
+#   0) TL;DR (3–5 bullets)
 #   1) What I see
 #   2) Verdict + recommendations
-#   3) ASCII wireframe concept (monospace, width-limited to avoid mobile wrapping)
+#   3) ASCII concept (wireframe for UI / composition wireframe for non-UI)
 #   4) References block (meaning-based; patterns + example products + Pinterest/Dribbble links; no images)
 # - EN by default, RU toggle
 # - Menu shown only after /start and at the end of each review
@@ -21,6 +22,7 @@
 # - NEW: Expanded feedback (ranked issues + detailed critique + longer fix plan)
 # - NEW: Works for ANY image (UI OR non-UI). Uses adaptive critique rubric (ui/photo/poster/chart/document/etc.)
 # - NEW: ASCII concept becomes "composition wireframe" for non-UI images
+# - NEW: TL;DR block (quick actionable bullets)
 
 import asyncio
 import base64
@@ -61,7 +63,7 @@ from openai import OpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini").strip()
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))  # NEW
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 
 # Admin username (without @)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "uxd_ink").strip().lstrip("@").lower()
@@ -129,7 +131,6 @@ async def log_event(
     score: Optional[int] = None,
     error: Optional[str] = None,
 ) -> None:
-    # Keep it robust: never crash bot because of analytics
     try:
         async with _db_lock:
             _db.execute(
@@ -174,7 +175,6 @@ async def get_stats_summary() -> Dict[str, Any]:
         photo_7d = q("SELECT COUNT(*) FROM events WHERE event='review_done' AND input_type='photo' AND ts>=?", (week,))
         figma_7d = q("SELECT COUNT(*) FROM events WHERE event='review_done' AND input_type='figma' AND ts>=?", (week,))
 
-        # Top errors (last 7d)
         cur = _db.execute(
             """
             SELECT error, COUNT(*) as c
@@ -236,7 +236,6 @@ def is_admin_uid(uid: int) -> bool:
     return u == ADMIN_USERNAME
 
 
-# NEW: Strip any leftover priority tags if the model outputs them
 _PRI_RE = re.compile(r"\s*\[(?:P0|P1|P2|P3)\]\s*", re.IGNORECASE)
 
 
@@ -245,6 +244,79 @@ def strip_priority_tags(text: str) -> str:
     text = _PRI_RE.sub(" ", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
+
+
+# ----------------------------
+# Telegram: safe long text sending (no HTML breakage)
+# ----------------------------
+
+TG_MAX_CHARS = 3900  # margin vs Telegram 4096
+
+
+def split_text_chunks(text: str, limit: int = TG_MAX_CHARS) -> List[str]:
+    s = (text or "").strip()
+    if not s:
+        return []
+    if len(s) <= limit:
+        return [s]
+
+    parts: List[str] = []
+    paras = s.split("\n\n")
+    buf = ""
+
+    def flush():
+        nonlocal buf
+        if buf.strip():
+            parts.append(buf.strip())
+        buf = ""
+
+    for p in paras:
+        piece = p.strip()
+        if not piece:
+            continue
+
+        candidate = (buf + "\n\n" + piece).strip() if buf else piece
+        if len(candidate) <= limit:
+            buf = candidate
+            continue
+
+        flush()
+
+        if len(piece) <= limit:
+            buf = piece
+            continue
+
+        lines = piece.split("\n")
+        line_buf = ""
+        for ln in lines:
+            ln = ln.rstrip()
+            candidate2 = (line_buf + "\n" + ln).strip() if line_buf else ln
+            if len(candidate2) <= limit:
+                line_buf = candidate2
+                continue
+
+            if line_buf.strip():
+                parts.append(line_buf.strip())
+                line_buf = ""
+
+            if len(ln) > limit:
+                start = 0
+                while start < len(ln):
+                    parts.append(ln[start:start + limit].strip())
+                    start += limit
+            else:
+                line_buf = ln
+
+        if line_buf.strip():
+            parts.append(line_buf.strip())
+
+    flush()
+    return [p for p in parts if p]
+
+
+async def send_long_plain(message: Message, text: str, *, disable_web_page_preview: bool = False) -> None:
+    for chunk in split_text_chunks(text):
+        await message.answer(chunk, disable_web_page_preview=disable_web_page_preview)
 
 
 TXT = {
@@ -272,6 +344,7 @@ TXT = {
         "refs_fail": "Couldn’t build references this time. Try again.",
         "not_image": "I need an image (photo/screenshot) or a public Figma link.",
         "figma_fetch_fail": "Couldn’t fetch a preview from that Figma link. Make sure the file is public.",
+        "tldr": "TL;DR",
         "whatisee": "What I see",
         "verdict": "Verdict & recommendations",
         "concept": "ASCII concept",
@@ -318,6 +391,7 @@ TXT = {
         "refs_fail": "Не получилось собрать референсы. Попробуй ещё раз.",
         "not_image": "Мне нужна картинка (фото/скрин) или ссылка на Figma.",
         "figma_fetch_fail": "Не смог скачать превью по ссылке Figma. Убедись, что файл публичный.",
+        "tldr": "TL;DR",
         "whatisee": "Что я вижу",
         "verdict": "Вердикт и рекомендации",
         "concept": "ASCII-концепт",
@@ -386,7 +460,6 @@ def channel_inline_kb() -> InlineKeyboardMarkup:
 # ----------------------------
 
 def retro_bar_frame(step: int, width: int = 16) -> str:
-    # more “alive” retro bar: bouncing head + shimmer
     pos = step % (width * 2 - 2)
     if pos >= width:
         pos = (width * 2 - 2) - pos
@@ -436,7 +509,6 @@ async def animate_progress_until_done(
             pass
         await asyncio.sleep(tick)
 
-    # Optional: remove inline keyboard when done
     try:
         await msg.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -450,6 +522,7 @@ async def animate_progress_until_done(
 # ----------------------------
 
 FIGMA_RE = re.compile(r"https?://www\.figma\.com/(file|design)/[A-Za-z0-9]+/[^?\s]+.*", re.I)
+
 
 def is_figma_link(text: str) -> bool:
     return bool(FIGMA_RE.search(text or ""))
@@ -561,12 +634,6 @@ def llm_request_text_only(prompt_text: str) -> str:
 
 
 async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional[Dict[str, Any]]:
-    """
-    Expanded + adaptive review:
-    - Detect image_type
-    - Provide ranked issues + deeper critique + longer plan
-    - ASCII wireframe becomes "composition wireframe" for non-UI
-    """
     if not client:
         return {"error": "no_llm"}
 
@@ -586,59 +653,74 @@ Step 0) Decide image_type from:
 "ui" | "photo" | "illustration" | "poster" | "chart" | "document" | "mixed" | "unknown"
 
 Tasks:
-1) Describe what you see (short, factual). If unsure, say so.
-2) Provide an expanded verdict with multiple angles (NOT just one main problem).
-   Always follow this structure (exact headings, more detailed content):
+
+1) Produce TL;DR in 3–5 bullets, immediately actionable.
+   Target: 35–80 words total.
+
+2) Describe what you see (DETAILED but factual).
+   what_i_see MUST be:
+   - intro paragraph (2–4 sentences: what it is + likely purpose)
+   - then 10–18 concrete observations as bullets
+   - then "Assumptions & uncertainty" (1–3 sentences)
+   Target length: 180–320 words.
+
+3) Provide an expanded verdict (long).
+   Put ALL of this inside the "verdict" string, with EXACT headings below:
 
    Summary:
-   - <2–4 bullets: what works + what doesn't>
+   - 5–8 bullets (mix: what works / what fails)
 
    Top issues (ranked):
    1) <issue> — <impact> — <fix>
    2) <issue> — <impact> — <fix>
    3) <issue> — <impact> — <fix>
-   4) <optional issue> — <impact> — <fix>
+   4) <issue> — <impact> — <fix>
+   5) <optional> — <impact> — <fix>
 
    Detail critique:
-   - Clarity & hierarchy: <3–6 bullets>
-   - Composition & spacing: <3–6 bullets>
-   - Contrast & readability: <2–5 bullets>
-   - Content & messaging: <2–5 bullets>
-   - If image_type == "ui": add "Interaction & states" with <3–6 bullets>
-   - If image_type in ["photo","illustration","poster"]: add "Lighting / color / focus" (or "style consistency") with <3–6 bullets>
-   - If image_type == "chart": add "Data integrity & labeling" with <3–6 bullets>
-   - If image_type == "document": add "Scan quality & structure" with <3–6 bullets>
+   - Clarity & hierarchy: 6–10 bullets
+   - Composition & spacing: 6–10 bullets
+   - Contrast & readability: 5–9 bullets
+   - Content & messaging: 5–9 bullets
+
+   Conditional sections:
+   - If image_type == "ui": add "Interaction & states" with 6–10 bullets
+   - If image_type in ["photo","illustration","poster"]: add "Lighting / color / focus (or style consistency)" with 6–10 bullets
+   - If image_type == "chart": add "Data integrity & labeling" with 6–10 bullets
+   - If image_type == "document": add "Scan quality & structure" with 6–10 bullets
 
    Fix plan (next iteration):
-   - <5–9 bullets, ordered steps>
+   - 10–16 bullets, ordered steps
 
-   If applicable, give "Before → After" micro-fixes:
-   - <3–6 examples>. For UI these can be copy/CTA labels; for posters it can be headline/subhead;
-     for charts it can be label/legend; for photos it can be crop/focus notes.
+   Micro-fixes (Before → After):
+   - 6–12 examples. UI: copy/CTA; poster: headline/subhead; chart: labels/legend; photo: crop/focus.
+
+   Target length for verdict: 550–1100 words.
+   Avoid generic advice; every bullet must mention a visible element or a concrete change.
 
 Rules:
 - DO NOT use priority tags like [P0]/[P1]/[P2] or any brackets marking priority.
 - Do NOT guess fonts or hex colors.
 - Be specific: reference visible elements by name/position (top bar, left column, main subject, legend, axis, headline, etc.)
 
-3) Provide a score from 1 to 10 (integer) using rubric:
+4) Provide a score from 1 to 10 (integer) using rubric:
    1–3: broken/confusing; major issues everywhere
    4–6: works but weak; serious clarity/composition issues
    7–8: solid; several fixable issues
    9–10: excellent; minor polish only
    IMPORTANT: do not default to 7. Pick the score that matches the rubric and the image_type.
 
-4) Provide an ASCII concept that fits exactly within width={ascii_w} characters per line.
-   - If image_type == "ui": make a UI wireframe.
-   - Otherwise: make a "composition wireframe" (main subject, supporting elements, focal point, text blocks if any).
-   - Provide as an array of strings (ascii_concept).
-   - Each line MUST be <= {ascii_w} chars.
+5) Provide an ASCII concept within width={ascii_w} characters per line.
+   - If image_type == "ui": UI wireframe.
+   - Otherwise: composition wireframe (main subject, supporting elements, focal point, text blocks if any).
+   - ascii_concept is an array of strings, each <= {ascii_w} chars.
 
 JSON schema:
 {{
   "language": "{language}",
   "image_type": "unknown",
   "score_10": 0,
+  "tldr": "...",
   "what_i_see": "...",
   "verdict": "...",
   "ascii_width": {ascii_w},
@@ -655,7 +737,7 @@ JSON schema:
 
 
 # ----------------------------
-# References (meaning-based + Pinterest; simplified scope)
+# References (meaning-based + Pinterest)
 # ----------------------------
 
 def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
@@ -684,8 +766,7 @@ def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
 Правила:
 - 5–7 items
 - Если это не UI — допускай паттерны про композицию, типографику, постеры, инфографику, фотокадрирование, визуальную иерархию, читабельность.
-- НЕ пытайся угадать домен/платформу. Просто делай максимально точные ключевые запросы (EN) по паттерну и компонентам.
-- search_keywords: английский, конкретно (pattern + components + constraint)
+- НЕ пытайся угадать домен/платформу. Делай точные EN запросы (pattern + components + constraint).
 - example_products: реальные продукты/дизайн-системы/гайдлайны/книги/статьи/стандарты
 - Никаких ссылок. Только JSON.
 """.strip()
@@ -713,8 +794,8 @@ Output (strict JSON):
 
 Rules:
 - 5–7 items
-- If this is not UI, patterns can be about composition, typography, posters, infographics, photo framing, visual hierarchy, readability.
-- Don't guess domain/platform. Focus on very specific EN queries (pattern + components + constraints).
+- If not UI, patterns can be about composition, typography, posters, infographics, photo framing, visual hierarchy, readability.
+- Don't guess domain/platform. Use specific EN queries (pattern + components + constraints).
 - No links. JSON only.
 """.strip()
 
@@ -743,7 +824,6 @@ def build_reference_links(keywords: List[str]) -> List[str]:
     if not q:
         q = quote_plus("visual hierarchy composition design critique")
 
-    # Only 3 searches (as you requested)
     return [
         _make_link("Pinterest", f"https://www.pinterest.com/search/pins/?q={q}"),
         _make_link("Dribbble", f"https://dribbble.com/search/{q}"),
@@ -875,7 +955,6 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
             await log_event(user_id=uid, username=username, lang=lang, event="review_failed", input_type=input_type, error="no_llm")
             return
 
-        # enforce language
         result["language"] = lang_for(uid)
 
         try:
@@ -884,16 +963,24 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
             score_int = 0
         score_int = max(1, min(10, score_int))
 
+        tldr_text = str(result.get("tldr", "")).strip()
         what_i_see_text = str(result.get("what_i_see", "")).strip()
         verdict_text = strip_priority_tags(str(result.get("verdict", "")).strip())
 
+        # 0) TL;DR (header + long split)
+        header0 = f"<b>{escape_html(t(uid,'tldr'))}</b>\n<b>{escape_html(t(uid,'score'))}: {score_int}/10</b>"
+        await message.answer(header0)
+        await send_long_plain(message, escape_html(tldr_text))
+
+        if CANCEL_FLAGS.get(uid):
+            await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
+            await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
+            return
+
         # 1) What I see
-        msg1 = (
-            f"<b>{escape_html(t(uid,'whatisee'))}</b>\n"
-            f"{escape_html(what_i_see_text)}\n\n"
-            f"<b>{escape_html(t(uid,'score'))}: {score_int}/10</b>"
-        )
-        await message.answer(msg1)
+        header1 = f"<b>{escape_html(t(uid,'whatisee'))}</b>"
+        await message.answer(header1)
+        await send_long_plain(message, escape_html(what_i_see_text))
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
@@ -901,8 +988,9 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
             return
 
         # 2) Verdict
-        msg2 = f"<b>{escape_html(t(uid,'verdict'))}</b>\n{escape_html(verdict_text)}"
-        await message.answer(msg2)
+        header2 = f"<b>{escape_html(t(uid,'verdict'))}</b>"
+        await message.answer(header2)
+        await send_long_plain(message, escape_html(verdict_text))
 
         if CANCEL_FLAGS.get(uid):
             await message.answer(escape_html(t(uid, "cancelled")), reply_markup=main_menu_kb(uid))
@@ -978,7 +1066,6 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
             refs_msg = format_refs_block(uid, refs)
             await message.answer(refs_msg, disable_web_page_preview=True)
 
-        # end menu
         await message.answer(escape_html(t(uid, "need_input")), reply_markup=main_menu_kb(uid))
 
         dur_ms = int((time.time() - t0) * 1000)
@@ -1061,7 +1148,6 @@ async def on_text(m: Message, bot: Bot):
 
     txt = (m.text or "").strip()
 
-    # admin-only stats via button
     if txt == t(uid, "menu_stats"):
         if not is_admin_message(m):
             return
@@ -1083,7 +1169,6 @@ async def on_text(m: Message, bot: Bot):
         await m.answer(msg, reply_markup=main_menu_kb(uid))
         return
 
-    # /stats command
     if txt.lower() == "/stats":
         if not is_admin_message(m):
             return
@@ -1101,7 +1186,6 @@ async def on_text(m: Message, bot: Bot):
         await m.answer(msg, reply_markup=main_menu_kb(uid))
         return
 
-    # menu actions
     if txt == t(uid, "menu_how"):
         await m.answer(escape_html(t(uid, "how")), reply_markup=main_menu_kb(uid))
         return
@@ -1120,7 +1204,6 @@ async def on_text(m: Message, bot: Bot):
         await m.answer(escape_html(t(uid, "need_input")))
         return
 
-    # figma link
     if is_figma_link(txt):
         if RUNNING_TASK.get(uid) and not RUNNING_TASK[uid].done():
             await m.answer(escape_html(t(uid, "busy")))
@@ -1131,7 +1214,6 @@ async def on_text(m: Message, bot: Bot):
             await m.answer(escape_html(t(uid, "figma_fetch_fail")), reply_markup=main_menu_kb(uid))
             return
 
-        # preview
         try:
             photo = BufferedInputFile(thumb, filename="figma_preview.png")
             await m.answer_photo(photo=photo, caption=escape_html(t(uid, "preview")))
