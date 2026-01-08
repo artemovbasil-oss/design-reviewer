@@ -18,6 +18,9 @@
 # - Made verdict stricter + more structured (highlights flaws better)
 # - Fixed "score always 7/10" by removing anchoring example score_10: 7 -> 0 + rubric
 # - Added optional temperature control via env LLM_TEMPERATURE (default 0.7)
+# - NEW: Expanded feedback (ranked issues + detailed critique + longer fix plan)
+# - NEW: Works for ANY image (UI OR non-UI). Uses adaptive critique rubric (ui/photo/poster/chart/document/etc.)
+# - NEW: ASCII concept becomes "composition wireframe" for non-UI images
 
 import asyncio
 import base64
@@ -248,30 +251,30 @@ TXT = {
     "en": {
         "title": "Design Reviewer",
         "start": (
-            "I'm your design review partner.\n\n"
+            "I'm your review partner.\n\n"
             "Send me:\n"
-            "• screenshots (images)\n"
+            "• any image (UI screenshot, photo, poster, chart, etc.)\n"
             "• Figma frame links (public files)\n\n"
-            "Tap “Submit for review” or just send a screenshot/link."
+            "Tap “Submit for review” or just send an image/link."
         ),
         "how": (
             "How it works:\n"
-            "1) Send a screenshot or a public Figma frame link\n"
-            "2) I analyze what’s on the screen\n"
-            "3) I give a tough-but-fair review + a wireframe concept\n"
+            "1) Send an image or a public Figma frame link\n"
+            "2) I analyze what’s in it (UI or non-UI)\n"
+            "3) I give a tough-but-fair review + an ASCII concept\n"
             "4) I give references (patterns + example products + links)"
         ),
-        "need_input": "Send a screenshot or a public Figma frame link.",
+        "need_input": "Send an image or a public Figma frame link.",
         "cancelled": "Cancelled.",
         "busy": "I’m already reviewing something. Hit Cancel, or wait for the result.",
         "no_llm": "LLM is disabled (no OPENAI_API_KEY). Add it to Railway Variables.",
-        "llm_fail": "LLM error. Try again (or send a clearer / larger screenshot).",
+        "llm_fail": "LLM error. Try again (or send a clearer / larger image).",
         "refs_fail": "Couldn’t build references this time. Try again.",
-        "not_image": "I need a screenshot image or a Figma link.",
+        "not_image": "I need an image (photo/screenshot) or a public Figma link.",
         "figma_fetch_fail": "Couldn’t fetch a preview from that Figma link. Make sure the file is public.",
         "whatisee": "What I see",
         "verdict": "Verdict & recommendations",
-        "concept": "Wireframe concept (ASCII)",
+        "concept": "ASCII concept",
         "refs": "References (meaning-based)",
         "score": "Score",
         "channel_msg": "Channel:",
@@ -282,7 +285,7 @@ TXT = {
         "menu_stats": "Stats",
         "btn_cancel": "Cancel",
         "progress_title": "Review in progress",
-        "progress_wire": "Drafting wireframe",
+        "progress_wire": "Drafting concept",
         "progress_refs": "Finding references",
         "preview": "Preview",
         "refs_sub": "Patterns → examples → links",
@@ -294,30 +297,30 @@ TXT = {
     "ru": {
         "title": "Design Reviewer",
         "start": (
-            "Я твой партнёр по дизайн-ревью.\n\n"
+            "Я твой партнёр по ревью.\n\n"
             "Принимаю:\n"
-            "• скриншоты (картинки)\n"
+            "• любые картинки (UI, фото, постеры, графики и т.д.)\n"
             "• ссылки на фреймы Figma (если файл публичный)\n\n"
-            "Жми «Закинуть на ревью» или просто отправь скрин/ссылку."
+            "Жми «Закинуть на ревью» или просто отправь картинку/ссылку."
         ),
         "how": (
             "Как это работает:\n"
-            "1) Отправь скриншот или публичную ссылку на Figma фрейм\n"
-            "2) Я опишу, что вижу на экране\n"
-            "3) Дам честный разбор + черновой вайрфрейм\n"
-            "4) Дам референсы: паттерны + примеры продуктов + ссылки"
+            "1) Отправь картинку или публичную ссылку на Figma фрейм\n"
+            "2) Я опишу, что вижу (UI и не только)\n"
+            "3) Дам честный разбор + ASCII-концепт\n"
+            "4) Дам референсы: паттерны + примеры + ссылки"
         ),
-        "need_input": "Отправь скриншот или публичную ссылку на Figma фрейм.",
+        "need_input": "Отправь картинку или публичную ссылку на Figma фрейм.",
         "cancelled": "Отменено.",
         "busy": "Я уже делаю ревью. Нажми Cancel или дождись результата.",
         "no_llm": "LLM отключён (нет OPENAI_API_KEY). Добавь его в Railway Variables.",
-        "llm_fail": "Ошибка LLM. Попробуй ещё раз (или пришли скрин крупнее/четче).",
+        "llm_fail": "Ошибка LLM. Попробуй ещё раз (или пришли картинку крупнее/четче).",
         "refs_fail": "Не получилось собрать референсы. Попробуй ещё раз.",
-        "not_image": "Мне нужен скриншот или ссылка на Figma.",
+        "not_image": "Мне нужна картинка (фото/скрин) или ссылка на Figma.",
         "figma_fetch_fail": "Не смог скачать превью по ссылке Figma. Убедись, что файл публичный.",
         "whatisee": "Что я вижу",
         "verdict": "Вердикт и рекомендации",
-        "concept": "Wireframe-концепт (ASCII)",
+        "concept": "ASCII-концепт",
         "refs": "Референсы по смыслу",
         "score": "Оценка",
         "channel_msg": "Канал:",
@@ -328,7 +331,7 @@ TXT = {
         "menu_stats": "Статистика",
         "btn_cancel": "Cancel",
         "progress_title": "Ревью в процессе",
-        "progress_wire": "Собираю wireframe",
+        "progress_wire": "Собираю концепт",
         "progress_refs": "Подбираю референсы",
         "preview": "Превью",
         "refs_sub": "Паттерны → примеры → ссылки",
@@ -433,7 +436,7 @@ async def animate_progress_until_done(
             pass
         await asyncio.sleep(tick)
 
-    # Optional: remove inline keyboard when done (Telegram doesn't let you delete other bot msgs reliably)
+    # Optional: remove inline keyboard when done
     try:
         await msg.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -530,7 +533,7 @@ def llm_request_with_image(prompt_text: str, data_uri: str) -> str:
 
     resp = client.responses.create(
         model=LLM_MODEL,
-        temperature=LLM_TEMPERATURE,  # NEW
+        temperature=LLM_TEMPERATURE,
         input=[{
             "role": "user",
             "content": [
@@ -548,7 +551,7 @@ def llm_request_text_only(prompt_text: str) -> str:
 
     resp = client.responses.create(
         model=LLM_MODEL,
-        temperature=LLM_TEMPERATURE,  # NEW
+        temperature=LLM_TEMPERATURE,
         input=[{
             "role": "user",
             "content": [{"type": "input_text", "text": prompt_text}],
@@ -558,59 +561,83 @@ def llm_request_text_only(prompt_text: str) -> str:
 
 
 async def llm_review_image(img_bytes: bytes, uid: int, ascii_w: int) -> Optional[Dict[str, Any]]:
+    """
+    Expanded + adaptive review:
+    - Detect image_type
+    - Provide ranked issues + deeper critique + longer plan
+    - ASCII wireframe becomes "composition wireframe" for non-UI
+    """
     if not client:
         return {"error": "no_llm"}
 
     language = lang_for(uid)
     data_uri = img_to_data_uri_png(img_bytes)
 
-    # NEW: stricter prompt + no priority tags + no score anchoring
     prompt = f"""
-You are a strict senior product designer doing a design review.
+You are a strict senior product designer and visual critic.
+The input can be ANY image (UI screen, photo, poster, illustration, chart, document scan, etc.).
 
 Return ONLY valid JSON. No markdown. No extra keys.
 
 Language: "{language}" ("en" or "ru").
 Be blunt but professional. No profanity.
 
+Step 0) Decide image_type from:
+"ui" | "photo" | "illustration" | "poster" | "chart" | "document" | "mixed" | "unknown"
+
 Tasks:
-1) Describe what you see on the screenshot (short, factual).
-2) Provide a strict verdict with clearly highlighted flaws and concrete fixes.
-   Structure the verdict exactly like this:
+1) Describe what you see (short, factual). If unsure, say so.
+2) Provide an expanded verdict with multiple angles (NOT just one main problem).
+   Always follow this structure (exact headings, more detailed content):
 
-   Biggest problem: <one sentence>
+   Summary:
+   - <2–4 bullets: what works + what doesn't>
 
-   Critical issues:
-   - <3–5 bullets, what breaks usability/conversion>
+   Top issues (ranked):
+   1) <issue> — <impact> — <fix>
+   2) <issue> — <impact> — <fix>
+   3) <issue> — <impact> — <fix>
+   4) <optional issue> — <impact> — <fix>
 
-   UX/UI issues:
-   - <3–6 bullets, hierarchy, clarity, spacing, states, copy>
+   Detail critique:
+   - Clarity & hierarchy: <3–6 bullets>
+   - Composition & spacing: <3–6 bullets>
+   - Contrast & readability: <2–5 bullets>
+   - Content & messaging: <2–5 bullets>
+   - If image_type == "ui": add "Interaction & states" with <3–6 bullets>
+   - If image_type in ["photo","illustration","poster"]: add "Lighting / color / focus" (or "style consistency") with <3–6 bullets>
+   - If image_type == "chart": add "Data integrity & labeling" with <3–6 bullets>
+   - If image_type == "document": add "Scan quality & structure" with <3–6 bullets>
 
    Fix plan (next iteration):
-   - <3–6 bullets, concrete edits and ordering of blocks>
+   - <5–9 bullets, ordered steps>
 
-   Copy fixes:
-   - <2–4 examples "Before → After">
+   If applicable, give "Before → After" micro-fixes:
+   - <3–6 examples>. For UI these can be copy/CTA labels; for posters it can be headline/subhead;
+     for charts it can be label/legend; for photos it can be crop/focus notes.
 
-   Rules:
-   - DO NOT use priority tags like [P0]/[P1]/[P2] or any brackets marking priority.
-   - Do NOT guess fonts or hex colors.
-   - Refer to UI parts by name (header, primary CTA, form fields, tabs, pricing block, errors, empty state, etc.)
+Rules:
+- DO NOT use priority tags like [P0]/[P1]/[P2] or any brackets marking priority.
+- Do NOT guess fonts or hex colors.
+- Be specific: reference visible elements by name/position (top bar, left column, main subject, legend, axis, headline, etc.)
 
 3) Provide a score from 1 to 10 (integer) using rubric:
    1–3: broken/confusing; major issues everywhere
-   4–6: works but weak; serious clarity/hierarchy issues
+   4–6: works but weak; serious clarity/composition issues
    7–8: solid; several fixable issues
    9–10: excellent; minor polish only
-   IMPORTANT: do not default to 7. Pick the score that matches the rubric.
+   IMPORTANT: do not default to 7. Pick the score that matches the rubric and the image_type.
 
-4) Provide an ASCII wireframe concept that fits exactly within width={ascii_w} characters per line.
+4) Provide an ASCII concept that fits exactly within width={ascii_w} characters per line.
+   - If image_type == "ui": make a UI wireframe.
+   - Otherwise: make a "composition wireframe" (main subject, supporting elements, focal point, text blocks if any).
    - Provide as an array of strings (ascii_concept).
    - Each line MUST be <= {ascii_w} chars.
 
 JSON schema:
 {{
   "language": "{language}",
+  "image_type": "unknown",
   "score_10": 0,
   "what_i_see": "...",
   "verdict": "...",
@@ -656,9 +683,10 @@ def build_refs_prompt(lang: str, what_i_see: str, verdict: str) -> str:
 
 Правила:
 - 5–7 items
+- Если это не UI — допускай паттерны про композицию, типографику, постеры, инфографику, фотокадрирование, визуальную иерархию, читабельность.
 - НЕ пытайся угадать домен/платформу. Просто делай максимально точные ключевые запросы (EN) по паттерну и компонентам.
 - search_keywords: английский, конкретно (pattern + components + constraint)
-- example_products: реальные продукты/дизайн-системы/гайдлайны
+- example_products: реальные продукты/дизайн-системы/гайдлайны/книги/статьи/стандарты
 - Никаких ссылок. Только JSON.
 """.strip()
     else:
@@ -685,6 +713,7 @@ Output (strict JSON):
 
 Rules:
 - 5–7 items
+- If this is not UI, patterns can be about composition, typography, posters, infographics, photo framing, visual hierarchy, readability.
 - Don't guess domain/platform. Focus on very specific EN queries (pattern + components + constraints).
 - No links. JSON only.
 """.strip()
@@ -712,13 +741,13 @@ def build_reference_links(keywords: List[str]) -> List[str]:
     picked = kws[:2]
     q = quote_plus(" ".join(picked)) if picked else ""
     if not q:
-        q = quote_plus("ux ui pattern")
+        q = quote_plus("visual hierarchy composition design critique")
 
     # Only 3 searches (as you requested)
     return [
         _make_link("Pinterest", f"https://www.pinterest.com/search/pins/?q={q}"),
         _make_link("Dribbble", f"https://dribbble.com/search/{q}"),
-        _make_link("Google (pattern)", f"https://www.google.com/search?q={q}+ui+pattern"),
+        _make_link("Google (pattern)", f"https://www.google.com/search?q={q}+design+principles"),
     ]
 
 
@@ -856,7 +885,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
         score_int = max(1, min(10, score_int))
 
         what_i_see_text = str(result.get("what_i_see", "")).strip()
-        verdict_text = strip_priority_tags(str(result.get("verdict", "")).strip())  # NEW
+        verdict_text = strip_priority_tags(str(result.get("verdict", "")).strip())
 
         # 1) What I see
         msg1 = (
@@ -880,7 +909,7 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
             await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
             return
 
-        # 3) ASCII wireframe (spinner)
+        # 3) ASCII concept (spinner)
         done2 = asyncio.Event()
         spinner2 = asyncio.create_task(
             animate_progress_until_done(
@@ -964,7 +993,6 @@ async def do_review(message: Message, bot: Bot, img_bytes: bytes, uid: int, inpu
         )
 
     except asyncio.CancelledError:
-        # cancelled by user
         await log_event(user_id=uid, username=username, lang=lang, event="review_cancelled", input_type=input_type)
         raise
     except Exception as e:
